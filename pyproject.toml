@@ -1,0 +1,40 @@
+[project]
+name = "swiftvr"
+version = "0.1.0"
+description = "One-step generative streaming real-time video restoration."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.14.0",
+    "diffusers>=0.40.0",
+    "accelerate>=1.15.0",
+    "safetensors>=0.8.0",
+    "numpy>=2.5.3",
+    "pillow>=12.3.0",
+    "decord>=0.6.0",
+    "imageio>=2.37.4",
+    "imageio-ffmpeg>=0.6.0",
+    "triton-windows>=3.8.0.post28 ; sys_platform == 'win32'",
+]
+
+[project.scripts]
+swiftvr = "swiftvr.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "swiftvr"
+module-root = ""
+
+# CUDA 13.2 wheels: required for Blackwell (sm_120) GPUs and available for
+# Windows and Linux. Change the index URL to match an older driver if needed.
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true

@@ -1,16 +1,17 @@
-# Core inference dependencies for SwiftVR.
-torch==2.10.0
-torchvision==0.25.0
-diffusers==0.36.0
-transformers==5.2.0
-accelerate==1.12.0
-safetensors==0.7.0
-numpy==1.26.0
-pillow==11.3.0
-einops==0.8.2
+# Core inference dependencies for SwiftVR (pip users; uv reads pyproject.toml).
+# Install torch from the CUDA index matching your driver first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu132
+torch>=2.14.0
+diffusers>=0.40.0
+accelerate>=1.15.0
+safetensors>=0.8.0
+numpy>=2.5.3
+pillow>=12.3.0
 
 # Video / image I/O
-decord==0.6.0
-imageio==2.37.2
-imageio-ffmpeg==0.6.0
+decord>=0.6.0
+imageio>=2.37.4
+imageio-ffmpeg>=0.6.0
 
+# Triton kernels for --fp8-dit and torch.compile (Linux torch wheels ship triton)
+triton-windows>=3.8.0.post28; sys_platform == "win32"

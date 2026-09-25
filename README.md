@@ -50,15 +50,17 @@ Single H100, causal streaming, 24 frames.
 git clone https://github.com/H-oliday/SwiftVR.git
 cd SwiftVR
 
-conda create -n swiftvr python=3.10 -y
-conda activate swiftvr
+# With uv (Windows / Linux). torch is pulled from the CUDA 13.2 index configured
+# in pyproject.toml (required for Blackwell GPUs such as RTX 50xx).
+uv sync                       # creates .venv (Python 3.13) and installs `swiftvr`
+uv run swiftvr --help
 
-# Install PyTorch matching your CUDA toolkit first, e.g. CUDA 12.4:
-pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu124
-
-# Install SwiftVR (editable) and its dependencies:
-pip install -e .
+# Or install the `swiftvr` command globally on PATH:
+uv tool install -e .
 ```
+
+With pip instead: install torch from the CUDA index matching your driver
+(e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu132`), then `pip install -e .`.
 
 <details>
 <summary><b>Hardware notes</b></summary>
@@ -76,7 +78,7 @@ pip install -e .
 | SwiftVR        | 2026.06 | Wan2.2-TI2V-5B | [🤗 HuggingFace](https://huggingface.co/H-oliday/SwiftVR) |
 
 ```bash
-huggingface-cli download H-oliday/SwiftVR --local-dir checkpoints/
+uv run hf download H-oliday/SwiftVR --local-dir checkpoints/
 ```
 
 Expected checkpoint layout, where `checkpoints/` is the directory passed to `from_pretrained`:
@@ -130,7 +132,7 @@ tail = session.flush()                                  # flush the final buffer
 ### Command line
 
 ```bash
-python scripts/inference.py \
+swiftvr \
   --input low_quality.mp4 \
   --output restored.mp4 \
   --checkpoint checkpoints/ \
@@ -139,7 +141,31 @@ python scripts/inference.py \
   --dtype bfloat16
 ```
 
-Use `--png` to write a PNG sequence.
+Use `--png` to write a PNG sequence. `python scripts/inference.py` accepts the same arguments.
+
+Memory knobs: `--reae-frame-batch-size` (default 2) bounds how many frames the
+autoencoder's stateless layers process at once; `--cudnn-benchmark` is off by
+default because its conv-algorithm search adds several GiB of peak memory.
+
+Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughput):
+
+| Options | GPU fps | Peak memory |
+| --- | --- | --- |
+| `--attention_backend sdpa --no-reae-fusion` (previous defaults) | 9.1 | 12.0 GiB |
+| `--fp8-dit --no-reae-fusion` | 15.5 | 7.4 GiB |
+| `--fp8-dit` | 17.2 | 8.0 GiB |
+| `--fp8-dit --torch_compile` | 23.3 | 8.0 GiB |
+
+* The default attention backend `auto` picks PyTorch's cuDNN attention when
+  FlashAttention/SageAttention is not installed.
+* The autoencoder runs channels-last with fused cuDNN convolutions by default
+  (encoder 110 → 60 ms, decoder 346 → 244 ms per 24-frame chunk, ~0.6 GiB more
+  memory). `--no-reae-fusion` restores the plain PyTorch path.
+* `--fp8-dit` runs the DiT's linear layers in FP8 (RTX 40 series or newer, bfloat16).
+  Its output differs slightly from bfloat16 (≈47 dB PSNR against the bfloat16 output).
+* `--torch_compile` fuses the DiT's elementwise ops. Compiling takes the first two
+  chunks (roughly 10–20 s), so it pays off only on longer videos. On Windows it uses
+  `triton-windows` (installed by `uv sync`); no C++ compiler is needed.
 
 ## 📁 Repository Structure
 
@@ -148,11 +174,12 @@ SwiftVR/
 ├── README.md
 ├── LICENSE
 ├── requirements.txt
-├── setup.py
+├── pyproject.toml                # package metadata, `swiftvr` console script, uv torch index
 ├── scripts/
-│   └── inference.py              # CLI entry point, thin wrapper over SwiftVRPipeline
+│   └── inference.py              # backward-compatible wrapper over swiftvr.cli
 └── swiftvr/
     ├── __init__.py               # exports SwiftVRPipeline
+    ├── cli.py                    # `swiftvr` command-line entry point
     ├── pipeline.py               # SwiftVRPipeline: from_pretrained / to / restore_video / stream
     ├── runner.py                 # four-stage pipelined runner: reader → H2D → GPU → writer
     ├── io.py                     # frame reading, GPU preprocessing, mp4 / PNG writing
