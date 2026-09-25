@@ -39,6 +39,11 @@ The model and checkpoint are unchanged; only packaging and inference code differ
 * **`cudnn.benchmark` off by default** (`--cudnn-benchmark` to enable). This makes
   the output bit-identical across runs and avoids several GiB of peak memory from
   the algorithm search.
+* **Spatial tiling** (`--tiled-dit`) for output resolutions that do not fit in GPU
+  memory, with resumable runs; ported from FlashVSR_plus. See
+  [Tiled processing](#tiled-processing).
+* **`--pad-align`** keeps the whole frame (the input is otherwise cropped to a
+  multiple of 8) and pads with reflection instead of black.
 
 Output is not bit-identical to upstream: the trained DiT amplifies small bf16
 differences, and FP8 differs from bf16 by about 47 dB PSNR. In a side-by-side
@@ -207,6 +212,61 @@ Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughp
   (e.g. `python3.14-dev` for a venv on the system Python 3.14); this also applies
   to `--fp8-dit`.
 
+Frame edges: the input is cropped to a multiple of 8 pixels (e.g. width 1918 →
+1912), and the upscaled frame is zero-padded on the right and bottom to a multiple
+of 32 before processing. `--pad-align` (`pad_align=True`) crops only to even sizes
+and pads by reflection instead. It changes the output, so it is off by default.
+
+### Tiled processing
+
+Peak GPU memory is set by the output resolution. For outputs that do not fit,
+`--tiled-dit` splits the input into overlapping square tiles, restores each tile
+over the whole video into a temporary mp4, and blends the tiles with feather
+weights into the final output.
+
+```bash
+swiftvr --input 1080p.mp4 --output 4320p.mp4 --checkpoint checkpoints/ \
+  --upscale 4 --fp8-dit --tiled-dit --tile-size 256 --overlap 24
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--tiled-dit` | off | Enable tiling (all stages, not only the DiT; the name matches FlashVSR_plus). |
+| `--tile-size` | 256 | Tile size in input pixels. `tile-size × upscale` must be a multiple of 32. |
+| `--overlap` | 24 | Overlap between tiles in input pixels (at most half the tile size). |
+| `--output-height` | native | Downscale the blended result to this height (area filter). |
+| `--temp-quality` | 80 | Quality 0–100 of the temporary tile videos (x265, yuv444p). |
+| `--resume` | off | Reuse the tiles that an interrupted run with the same settings completed. If all tiles are complete, the model is not loaded. |
+| `--temp-dir` | see below | Where the temporary tile videos go. |
+
+The Python API takes the same settings: `restore_video(..., tile_size=256,
+tile_overlap=24, output_height=None, temp_quality=80, resume=False, temp_dir=None)`.
+
+* Keep `tile-size × upscale` at 1024 or more. The shifted-window attention cannot
+  shift inside smaller tiles (a warning is printed). With `--upscale 4` this means
+  `--tile-size 256` or more.
+* Per-tile peak GPU memory (RTX 5060 Ti, measured as allocated memory):
+
+  | Tile output | FP8 DiT | bfloat16 |
+  | --- | --- | --- |
+  | 1024×1024 (`--tile-size 256`, 4×) | 7.5 GiB | 12.1 GiB |
+  | 1280×1280 (`--tile-size 320`, 4×) | 9.0 GiB | 13.6 GiB |
+  | 1536×1536 (`--tile-size 384`, 4×) | 10.8 GiB | out of memory on 16 GB |
+
+* `--resolution` cannot be combined with tiling, because the upscale factor must be
+  an integer. Use `--output-height` to change the output size.
+* The input is decoded once per tile. A 1080p input at `--upscale 4` with the
+  default tile size is 45 tiles, about 1.4× the pixels of an untiled run.
+* Temporary videos go to `_swiftvr_temp/tiles_<hash>` next to the output mp4 (for
+  `--png`, next to the PNG folder), or under `--temp-dir`. The hash covers every
+  setting that affects the tile pixels. Only this run's directory is deleted, after
+  stitching; directories left by other runs are listed in the log but not removed.
+* The temporary videos are lossy even at `--temp-quality 100` (x265 CRF 0 is not
+  lossless), including for `--png` output. At quality 80 they took about
+  0.65 MiB per second per output megapixel on a test clip.
+* Where the tiles overlap, the result is a weighted average of two tiles. Averaging
+  two slightly different generative outputs may soften detail there.
+
 ## 📁 Repository Structure
 
 ```text
@@ -223,6 +283,8 @@ SwiftVR/
     ├── pipeline.py               # SwiftVRPipeline: from_pretrained / to / restore_video / stream
     ├── runner.py                 # four-stage pipelined runner: reader → H2D → GPU → writer
     ├── io.py                     # frame reading, GPU preprocessing, mp4 / PNG writing
+    ├── tiling.py                 # spatial tiling: tile layout, feather blending, stitching
+    ├── resume.py                 # resumable tiled runs: manifest, temp tile directory
     ├── models/
     │   ├── fp8.py                # opt-in FP8 linear / feed-forward layers for the DiT
     │   ├── reae.py               # Restoration-aware Autoencoder

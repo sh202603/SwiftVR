@@ -24,6 +24,14 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
 KEEP_MAX_4K1 = True
 CROP_LQ_MULTIPLE = 8
+# With ``pad_align`` the LQ input is only cropped to even sizes (yuv420p mp4
+# needs even dimensions); the 32-alignment is then done by reflect padding.
+CROP_LQ_MULTIPLE_PAD_ALIGN = 2
+
+# LQ pixels that must surround a crop so that upscaling the crop and dropping
+# the margin equals upscaling the whole frame and cropping (integer factors,
+# ``align_corners=False``): bilinear reads the 1 px neighbourhood, bicubic 2 px.
+UPSCALE_MARGIN = {"bilinear": 1, "bicubic": 2, "nearest": 0}
 
 _INTERP_NEEDS_ALIGN = ("linear", "bilinear", "bicubic", "trilinear")
 
@@ -78,21 +86,23 @@ def _decord_batch_to_torch(frames):
     return torch.as_tensor(frames)
 
 
-def _read_image_chunk_uint8(paths: List[Path], crop_h: int, crop_w: int) -> torch.Tensor:
+def _read_image_chunk_uint8(paths: List[Path], crop_rect: Tuple[int, int, int, int]) -> torch.Tensor:
+    x1, y1, x2, y2 = crop_rect
     arrs = []
     for p in paths:
         with Image.open(p) as img:
             img = img.convert("RGB")
             w, h = img.size
-            if h < crop_h or w < crop_w:
-                raise ValueError(f"Frame too small: {p}, frame={h}x{w}, crop={crop_h}x{crop_w}")
-            arrs.append(np.asarray(img.crop((0, 0, crop_w, crop_h)), dtype=np.uint8))
+            if h < y2 or w < x2:
+                raise ValueError(f"Frame too small: {p}, frame={h}x{w}, crop={crop_rect}")
+            arrs.append(np.asarray(img.crop((x1, y1, x2, y2)), dtype=np.uint8))
     return torch.from_numpy(np.stack(arrs, axis=0)).contiguous()
 
 
-def get_video_info(video_path, fallback_fps=30) -> Tuple[int, int, int, float]:
+def get_video_info(video_path, fallback_fps=30,
+                   crop_multiple: int = CROP_LQ_MULTIPLE) -> Tuple[int, int, int, float]:
     """Return (total_frames, lq_height, lq_width, fps) with sizes cropped to a
-    multiple of ``CROP_LQ_MULTIPLE``."""
+    multiple of ``crop_multiple``."""
     path = Path(video_path)
     if path.is_dir():
         frames = list_image_frames(path)
@@ -100,7 +110,7 @@ def get_video_info(video_path, fallback_fps=30) -> Tuple[int, int, int, float]:
             raise ValueError(f"No valid image frames in: {path}")
         with Image.open(frames[0]) as img:
             w, h = img.convert("RGB").size
-        crop_h, crop_w = _crop_size_to_multiple(h, w, CROP_LQ_MULTIPLE)
+        crop_h, crop_w = _crop_size_to_multiple(h, w, crop_multiple)
         return len(frames), crop_h, crop_w, float(fallback_fps)
 
     vr = decord.VideoReader(uri=path.as_posix())
@@ -111,7 +121,7 @@ def get_video_info(video_path, fallback_fps=30) -> Tuple[int, int, int, float]:
         fps = float(fallback_fps)
     if not math.isfinite(fps) or fps <= 0:
         fps = float(fallback_fps)
-    crop_h, crop_w = _crop_size_to_multiple(f0.shape[0], f0.shape[1], CROP_LQ_MULTIPLE)
+    crop_h, crop_w = _crop_size_to_multiple(f0.shape[0], f0.shape[1], crop_multiple)
     return len(vr), crop_h, crop_w, fps
 
 
@@ -119,13 +129,29 @@ def selected_output_frame_names(input_folder) -> List[str]:
     return [f"{p.stem}.png" for p in list_image_frames(Path(input_folder))]
 
 
+def margin_crop_rect(rect: Tuple[int, int, int, int], margin: int, lq_h: int, lq_w: int,
+                     upscale: int) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+    """Grow the LQ crop ``rect`` = ``(x1, y1, x2, y2)`` by ``margin`` px on the
+    sides that are inside the ``lq_w`` x ``lq_h`` frame. Returns the read
+    rectangle and the ``(top, bottom, left, right)`` margin in upscaled pixels
+    that ``preprocess_clip_uint8`` trims after resizing."""
+    x1, y1, x2, y2 = rect
+    rx1, ry1 = max(0, x1 - margin), max(0, y1 - margin)
+    rx2, ry2 = min(lq_w, x2 + margin), min(lq_h, y2 + margin)
+    trim = ((y1 - ry1) * upscale, (ry2 - y2) * upscale, (x1 - rx1) * upscale, (rx2 - x2) * upscale)
+    return (rx1, ry1, rx2, ry2), trim
+
+
 def iter_video_clips_fixed_scheme(
-    video_path, clip_len: int, total_frames: int, crop_h: int, crop_w: int,
+    video_path, clip_len: int, total_frames: int, crop_rect: Tuple[int, int, int, int],
 ) -> Iterator[Tuple[ChunkSpec, torch.Tensor]]:
     """Yield ``(spec, raw_uint8_frames)`` for each fixed-size chunk.
 
-    ``raw_uint8_frames`` is a CPU ``[T, H, W, 3]`` uint8 tensor.
+    ``crop_rect`` is ``(x1, y1, x2, y2)`` in source pixels; ``(0, 0, lq_w, lq_h)``
+    reads the whole (cropped) frame. ``raw_uint8_frames`` is a CPU
+    ``[T, y2-y1, x2-x1, 3]`` uint8 tensor.
     """
+    x1, y1, x2, y2 = crop_rect
     path = Path(video_path)
     specs = build_chunk_specs(total_frames, clip_len)
 
@@ -133,7 +159,7 @@ def iter_video_clips_fixed_scheme(
         all_paths = list_image_frames(path)
         for spec in specs:
             chunk_paths = all_paths[spec.frame_start: spec.frame_start + spec.frame_count]
-            yield spec, _read_image_chunk_uint8(chunk_paths, crop_h, crop_w)
+            yield spec, _read_image_chunk_uint8(chunk_paths, crop_rect)
     else:
         try:
             decord.bridge.set_bridge("torch")
@@ -143,26 +169,41 @@ def iter_video_clips_fixed_scheme(
         for spec in specs:
             idx = list(range(spec.frame_start, spec.frame_start + spec.frame_count))
             frames = _decord_batch_to_torch(vr.get_batch(idx))
-            yield spec, frames[:, :crop_h, :crop_w, :].contiguous()
+            yield spec, frames[:, y1:y2, x1:x2, :].contiguous()
 
 
 # --------------------------------------------------------------------------- #
 # GPU preprocessing                                                           #
 # --------------------------------------------------------------------------- #
 
-def preprocess_clip_uint8(frames_uint8, out_h, out_w, mode, pad_h, pad_w, dtype):
+def preprocess_clip_uint8(frames_uint8, out_h, out_w, mode, pad_h, pad_w, dtype,
+                          trim=None, pad_mode="constant"):
     """``[T, H, W, 3]`` uint8 (CUDA) -> ``[1, T, 3, out_h+pad_h, out_w+pad_w]``
-    float in [0, 1]. Resizing and padding run on the GPU."""
+    float in [0, 1]. Resizing and padding run on the GPU.
+
+    ``trim`` = ``(top, bottom, left, right)``: the frames carry a margin that is
+    resized to ``out + trim`` and then dropped (see ``margin_crop_rect``).
+    ``pad_mode`` is ``"constant"`` (zeros) or ``"reflect"``; reflect falls back
+    to replicate when the padding is not smaller than the frame."""
     frames = frames_uint8.permute(0, 3, 1, 2).contiguous().to(dtype=dtype)
     _, _, h, w = frames.shape
-    if (h, w) != (out_h, out_w):
+    top, bottom, left, right = trim or (0, 0, 0, 0)
+    rs_h, rs_w = out_h + top + bottom, out_w + left + right
+    if (h, w) != (rs_h, rs_w):
         if mode in _INTERP_NEEDS_ALIGN:
-            frames = F.interpolate(frames, size=(out_h, out_w), mode=mode, align_corners=False)
+            frames = F.interpolate(frames, size=(rs_h, rs_w), mode=mode, align_corners=False)
         else:
-            frames = F.interpolate(frames, size=(out_h, out_w), mode=mode)
+            frames = F.interpolate(frames, size=(rs_h, rs_w), mode=mode)
+    if top or bottom or left or right:
+        frames = frames[:, :, top:top + out_h, left:left + out_w]
     frames = frames / 255.0
     if pad_h > 0 or pad_w > 0:
-        frames = F.pad(frames, (0, pad_w, 0, pad_h), mode="constant", value=0)
+        if pad_mode == "constant":
+            frames = F.pad(frames, (0, pad_w, 0, pad_h), mode="constant", value=0)
+        else:
+            if pad_mode == "reflect" and (pad_h >= out_h or pad_w >= out_w):
+                pad_mode = "replicate"
+            frames = F.pad(frames, (0, pad_w, 0, pad_h), mode=pad_mode)
     return frames.unsqueeze(0)
 
 

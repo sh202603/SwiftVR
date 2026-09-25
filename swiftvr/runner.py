@@ -10,7 +10,7 @@ import queue
 import threading
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -79,9 +79,10 @@ def _fmt_duration(seconds):
 class _Progress:
     """Single-line progress (``\\r``-overwritten) based on frames written."""
 
-    def __init__(self, total, enabled):
+    def __init__(self, total, enabled, prefix=""):
         self.total = max(1, int(total))
         self.enabled = enabled
+        self.prefix = prefix
         self.t0 = time.perf_counter()
         self._last_len = 0
 
@@ -91,7 +92,7 @@ class _Progress:
         elapsed = time.perf_counter() - self.t0
         fps = done / elapsed if elapsed > 0 else 0.0
         eta = (self.total - done) / fps if fps > 0 else 0.0
-        line = (f"  {100.0 * done / self.total:5.1f}% {done}/{self.total} frames | "
+        line = (f"  {self.prefix}{100.0 * done / self.total:5.1f}% {done}/{self.total} frames | "
                 f"{fps:.2f} fps (gpu {gpu_fps:.2f}) | {_fmt_duration(elapsed)} < ETA {_fmt_duration(eta)}")
         pad = " " * max(0, self._last_len - len(line))
         self._last_len = len(line)
@@ -131,7 +132,18 @@ def run_pipeline(
     queue_size: int = 3,
     png_frame_names: Optional[List[str]] = None,
     verbose: bool = True,
+    crop_rect: Optional[Tuple[int, int, int, int]] = None,
+    trim: Optional[Tuple[int, int, int, int]] = None,
+    pad_mode: str = "constant",
+    progress_prefix: str = "",
 ):
+    """Restore ``video_path`` and write it; returns ``(frames_written, seconds)``.
+
+    ``crop_rect`` = ``(x1, y1, x2, y2)`` selects the LQ region to read (default:
+    the whole ``lq_w`` x ``lq_h`` frame); ``trim`` is the upscaled margin around
+    it that is dropped after resizing (see ``io.margin_crop_rect``)."""
+    if crop_rect is None:
+        crop_rect = (0, 0, lq_w, lq_h)
     q_read = queue.Queue(maxsize=max(1, queue_size))
     q_gpu = queue.Queue(maxsize=max(1, queue_size))
     q_write = queue.Queue(maxsize=max(1, queue_size))
@@ -170,7 +182,7 @@ def run_pipeline(
     def reader_worker():
         try:
             clips = iter_video_clips_fixed_scheme(
-                video_path, clip_len=clip_len, total_frames=total_frames, crop_h=lq_h, crop_w=lq_w)
+                video_path, clip_len=clip_len, total_frames=total_frames, crop_rect=crop_rect)
             for spec, cpu_rgb in clips:
                 if stop_event.is_set():
                     break
@@ -261,7 +273,7 @@ def run_pipeline(
 
                 clip_rgb = preprocess_clip_uint8(
                     item.gpu_rgb, out_h=out_h, out_w=out_w, mode=upscale_mode,
-                    pad_h=pad_h, pad_w=pad_w, dtype=dtype)
+                    pad_h=pad_h, pad_w=pad_w, dtype=dtype, trim=trim, pad_mode=pad_mode)
                 z = tae_stream.encode_chunk_fixed(clip_rgb, spec)
 
                 if spec.ctype == ChunkType.LAST:
@@ -338,7 +350,7 @@ def run_pipeline(
         threading.Thread(target=writer_worker, name="writer", daemon=True),
     ]
     t0 = time.perf_counter()
-    progress = _Progress(total_frames, verbose)
+    progress = _Progress(total_frames, verbose, progress_prefix)
     for th in threads:
         th.start()
     for th in threads:
