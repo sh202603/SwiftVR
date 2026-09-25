@@ -11,6 +11,42 @@
   <a href="https://github.com/H-oliday/SwiftVR/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg?style=flat-square" alt="License"></a>
 </p>
 
+## About this fork (`modi` branch)
+
+This is a fork of [H-oliday/SwiftVR](https://github.com/H-oliday/SwiftVR).
+`main` mirrors upstream as-is; all changes live on `modi` (the default branch).
+The model and checkpoint are unchanged; only packaging and inference code differ.
+
+* **uv packaging and CLI.** `pyproject.toml` + `uv.lock` replace `setup.py`
+  (Python 3.13, torch from the CUDA 13.2 index for Blackwell / RTX 50xx), and a
+  `swiftvr` command replaces `python scripts/inference.py` (kept as a wrapper).
+  Runs on Windows without a C++ compiler.
+* **Lower GPU memory (device-independent).** The autoencoder processes its
+  stateless layers a few frames at a time, runs the decoder's full-resolution tail
+  only on the frames that are kept, and applies `TGrow` before the nearest
+  upsample (at 1/4 the pixels). The unfused Q/K/V weights are freed after QKV
+  fusion (~2.6 GiB). The first two come from
+  [LightX2V](https://github.com/ModelTC/LightX2V).
+* **Faster inference (CUDA only; other devices fall back to the original path).**
+  * cuDNN attention picked automatically when FlashAttention/SageAttention is absent
+  * fused channels-last cuDNN convolutions in the autoencoder (`--no-reae-fusion` to disable)
+  * opt-in FP8 DiT (`--fp8-dit`, RTX 40 series or newer)
+  * `--torch_compile` working on Windows via `triton-windows`
+
+  On an RTX 5060 Ti 16GB (640×480 → 1280×960) throughput goes from 9.1 to
+  23.3 fps and peak memory from 12.0 to 8.0 GiB; see
+  [Command line](#command-line) for the per-option table.
+* **`cudnn.benchmark` off by default** (`--cudnn-benchmark` to enable). This makes
+  the output bit-identical across runs and avoids several GiB of peak memory from
+  the algorithm search.
+
+Output is not bit-identical to upstream: the trained DiT amplifies small bf16
+differences, and FP8 differs from bf16 by about 47 dB PSNR. In a side-by-side
+visual comparison, no difference was visible between the configurations above.
+
+Tested only on Windows 11 with an RTX 5060 Ti 16GB. Linux and Apple Silicon (MPS)
+have not been run.
+
 ## Updates
 
 * [2026/06] Release the inference code and pretrained weights 🎉
@@ -47,7 +83,7 @@ Single H100, causal streaming, 24 frames.
 ## 🛠 Installation
 
 ```bash
-git clone https://github.com/H-oliday/SwiftVR.git
+git clone https://github.com/sh202603/SwiftVR.git   # default branch: modi
 cd SwiftVR
 
 # With uv (Windows / Linux). torch is pulled from the CUDA 13.2 index configured
@@ -184,6 +220,7 @@ SwiftVR/
     ├── runner.py                 # four-stage pipelined runner: reader → H2D → GPU → writer
     ├── io.py                     # frame reading, GPU preprocessing, mp4 / PNG writing
     ├── models/
+    │   ├── fp8.py                # opt-in FP8 linear / feed-forward layers for the DiT
     │   ├── reae.py               # Restoration-aware Autoencoder
     │   └── transformer.py        # DiT + mask-free shifted-window self-attention
     └── streaming/
