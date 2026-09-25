@@ -145,14 +145,27 @@ def run_pipeline(
     h2d_stream = torch.cuda.Stream(device=device) if use_cuda else None
     d2h_stream = torch.cuda.Stream(device=device) if use_cuda else None
 
+    # Queue operations poll stop_event so that a failed stage cannot leave the
+    # others blocked on a full or empty queue it will never touch again.
     def record_error(stage_name):
         stage_errors.append((stage_name, traceback.format_exc()))
         stop_event.set()
-        for q in (q_read, q_gpu, q_write):
+
+    def put(q, item):
+        while not stop_event.is_set():
             try:
-                q.put(_stop_item())
-            except Exception:
+                q.put(item, timeout=0.1)
+                return
+            except queue.Full:
                 pass
+
+    def get(q):
+        while True:
+            try:
+                return q.get(timeout=0.1)
+            except queue.Empty:
+                if stop_event.is_set():
+                    return _stop_item()
 
     def reader_worker():
         try:
@@ -165,17 +178,17 @@ def run_pipeline(
                     cpu_rgb = cpu_rgb.pin_memory()
                 except Exception:
                     pass
-                q_read.put(_Item(clip_idx=spec.clip_idx, spec=spec, cpu_rgb=cpu_rgb))
-            q_read.put(_stop_item())
+                put(q_read, _Item(clip_idx=spec.clip_idx, spec=spec, cpu_rgb=cpu_rgb))
+            put(q_read, _stop_item())
         except Exception:
             record_error("reader")
 
     def h2d_worker():
         try:
             while True:
-                item = q_read.get()
+                item = get(q_read)
                 if item.stop:
-                    q_gpu.put(_stop_item())
+                    put(q_gpu, _stop_item())
                     break
                 if stop_event.is_set():
                     continue
@@ -191,7 +204,7 @@ def run_pipeline(
                 else:
                     item.gpu_rgb = item.cpu_rgb.to(device=device)
                 item.cpu_rgb = None
-                q_gpu.put(item)
+                put(q_gpu, item)
         except Exception:
             record_error("h2d")
 
@@ -229,7 +242,7 @@ def run_pipeline(
             prev_dit_out_cpu = None
 
             while True:
-                item = q_gpu.get()
+                item = get(q_gpu)
                 if item.stop:
                     break
                 if stop_event.is_set():
@@ -270,10 +283,10 @@ def run_pipeline(
                     item.timings["gpu"] = time.perf_counter() - t0
 
                 item.gpu_rgb = None
-                q_write.put(_start_d2h(item))
+                put(q_write, _start_d2h(item))
                 del clip_rgb, z, z_ntchw, rgb_out
 
-            q_write.put(_stop_item())
+            put(q_write, _stop_item())
         except Exception:
             record_error("gpu")
 
@@ -281,7 +294,7 @@ def run_pipeline(
         writer = None
         try:
             while True:
-                item = q_write.get()
+                item = get(q_write)
                 if item.stop:
                     break
                 if stop_event.is_set():

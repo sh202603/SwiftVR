@@ -18,7 +18,7 @@ This is a fork of [H-oliday/SwiftVR](https://github.com/H-oliday/SwiftVR).
 The model and checkpoint are unchanged; only packaging and inference code differ.
 
 * **uv packaging and CLI.** `pyproject.toml` + `uv.lock` replace `setup.py`
-  (Python 3.13, torch from the CUDA 13.2 index for Blackwell / RTX 50xx), and a
+  (Python 3.12+, torch from the CUDA 13.2 index for Blackwell / RTX 50xx), and a
   `swiftvr` command replaces `python scripts/inference.py` (kept as a wrapper).
   Runs on Windows without a C++ compiler.
 * **Lower GPU memory (device-independent).** The autoencoder processes its
@@ -44,8 +44,9 @@ Output is not bit-identical to upstream: the trained DiT amplifies small bf16
 differences, and FP8 differs from bf16 by about 47 dB PSNR. In a side-by-side
 visual comparison, no difference was visible between the configurations above.
 
-Tested only on Windows 11 with an RTX 5060 Ti 16GB. Linux and Apple Silicon (MPS)
-have not been run.
+Tested on Windows 11 with an RTX 5060 Ti 16GB (Python 3.13) and on Ubuntu 26.04
+with an RTX 5080 16GB (Python 3.14). The measurements in this README come from
+the Windows machine. Apple Silicon (MPS) has not been run.
 
 ## Updates
 
@@ -88,7 +89,7 @@ cd SwiftVR
 
 # With uv (Windows / Linux). torch is pulled from the CUDA 13.2 index configured
 # in pyproject.toml (required for Blackwell GPUs such as RTX 50xx).
-uv sync                       # creates .venv (Python 3.13) and installs `swiftvr`
+uv sync                       # creates .venv (Python >= 3.12) and installs `swiftvr`
 uv run swiftvr --help
 
 # Or install the `swiftvr` command globally on PATH:
@@ -201,7 +202,10 @@ Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughp
   Its output differs slightly from bfloat16 (≈47 dB PSNR against the bfloat16 output).
 * `--torch_compile` fuses the DiT's elementwise ops. Compiling takes the first two
   chunks (roughly 10–20 s), so it pays off only on longer videos. On Windows it uses
-  `triton-windows` (installed by `uv sync`); no C++ compiler is needed.
+  `triton-windows` (installed by `uv sync`); no C++ compiler is needed. On Linux,
+  Triton builds a small C launcher on first use and needs the Python headers
+  (e.g. `python3.14-dev` for a venv on the system Python 3.14); this also applies
+  to `--fp8-dit`.
 
 ## 📁 Repository Structure
 
