@@ -18,6 +18,7 @@ from safetensors.torch import load_file
 
 from .models import ReAE, WanTransformer3DModel
 from .streaming import StreamingTAE, StreamingDiT
+from .streaming.tae import to_channels_last
 from .io import (
     get_video_info,
     selected_output_frame_names,
@@ -42,18 +43,26 @@ def _as_dtype(dtype) -> torch.dtype:
     return _DTYPES[key]
 
 
+# Frames per batch for the ReAE's stateless layers; ``None`` runs a whole chunk
+# at once (fastest, highest peak memory).
+DEFAULT_REAE_FRAME_BATCH_SIZE = 2
+
+
 def _aligned_pad(size: int, multiple: int = 32) -> int:
     return (multiple - size % multiple) % multiple
 
 
 class SwiftVRPipeline:
-    def __init__(self, reae, transformer, prompt_emb, upscale_mode: str = "bilinear"):
+    def __init__(self, reae, transformer, prompt_emb, upscale_mode: str = "bilinear",
+                 reae_frame_batch_size: Optional[int] = DEFAULT_REAE_FRAME_BATCH_SIZE,
+                 reae_fused: bool = True):
         self.reae = reae
         self.transformer = transformer
         self.prompt_emb = prompt_emb
         self.upscale_mode = upscale_mode
 
-        self.tae_stream = StreamingTAE(reae)
+        # fused: channels-last activations + cuDNN fused conv epilogues (CUDA only)
+        self.tae_stream = StreamingTAE(reae, frame_batch_size=reae_frame_batch_size, fused=reae_fused)
         self.dit_stream = StreamingDiT(transformer, overlap=0)
 
         self.device = torch.device("cpu")
@@ -73,6 +82,8 @@ class SwiftVRPipeline:
         transformer_subfolder: str = "transformer",
         prompt_embedding_filename: str = "prompt_embedding.safetensors",
         upscale_mode: str = "bilinear",
+        reae_frame_batch_size: Optional[int] = DEFAULT_REAE_FRAME_BATCH_SIZE,
+        reae_fused: bool = True,
         device=None,
         dtype=None,
     ) -> "SwiftVRPipeline":
@@ -82,29 +93,45 @@ class SwiftVRPipeline:
         transformer = WanTransformer3DModel.from_pretrained(str(root), subfolder=transformer_subfolder)
         prompt_emb = load_file(str(root / prompt_embedding_filename))["prompt_emb"][0]
 
-        pipe = cls(reae, transformer, prompt_emb, upscale_mode=upscale_mode)
+        pipe = cls(reae, transformer, prompt_emb, upscale_mode=upscale_mode,
+                   reae_frame_batch_size=reae_frame_batch_size, reae_fused=reae_fused)
         if device is not None or dtype is not None:
             pipe.to(device or "cpu", dtype=dtype or "float32")
         return pipe
 
-    def to(self, device=None, dtype=None, *, attention_backend="auto", torch_compile=False):
+    def to(self, device=None, dtype=None, *, attention_backend="auto", torch_compile=False,
+           cudnn_benchmark=False, fp8_dit=False):
         """Move the models to ``device``/``dtype`` and prepare them for inference
-        (fused projections + shifted-window self-attention, once)."""
+        (fused projections + shifted-window self-attention, once).
+
+        ``fp8_dit`` runs the DiT block GEMMs in FP8 (bf16 on an sm89+ GPU only):
+        several times faster GEMMs and ~4.6 GiB less weight memory, at a small
+        accuracy cost. Only takes effect on the first (preparing) call."""
         if device is not None:
             self.device = torch.device(device)
         if dtype is not None:
             self.dtype = _as_dtype(dtype)
+        if fp8_dit and not self._prepared:
+            from .models.fp8 import fp8_supported
+            if self.dtype != torch.bfloat16 or not fp8_supported(self.device):
+                raise ValueError("fp8_dit requires dtype=bfloat16 on a CUDA GPU with compute "
+                                 "capability 8.9+ (RTX 40 series or newer)")
 
         self.reae.to(self.device, self.dtype).eval()
+        if self.tae_stream.fused and self.device.type == "cuda":
+            to_channels_last(self.reae)
         self.transformer.to(self.device, self.dtype).eval()
 
-        enable_max_fps_runtime(allow_tf32=True)
+        enable_max_fps_runtime(allow_tf32=True, cudnn_benchmark=cudnn_benchmark)
         if not self._prepared and hasattr(self.transformer, "prepare_for_inference"):
             self.transformer.prepare_for_inference(
                 attention_backend=attention_backend,
                 use_torch_compile=torch_compile,
-                compile_mode="default")
+                compile_mode="default",
+                fp8=fp8_dit)
             self._prepared = True
+            if fp8_dit:
+                torch.cuda.empty_cache()  # return the freed bf16 weights
         return self
 
     # ------------------------------------------------------------------ #
@@ -175,6 +202,10 @@ class SwiftVRPipeline:
 
         self.dit_stream.overlap = dit_overlap
 
+        use_cuda = torch.cuda.is_available() and self.device.type == "cuda"
+        if use_cuda:
+            torch.cuda.reset_peak_memory_stats(self.device)
+
         written, wall = run_pipeline(
             video_path=input_path,
             final_output_path=str(final_video_path),
@@ -198,9 +229,14 @@ class SwiftVRPipeline:
             png_frame_names=png_frame_names,
             verbose=verbose,
         )
+        # Peak over this call only (model weights included, since they stay resident).
+        max_alloc = torch.cuda.max_memory_allocated(self.device) if use_cuda else 0
+        max_reserved = torch.cuda.max_memory_reserved(self.device) if use_cuda else 0
         return {"frames": written, "seconds": wall,
                 "fps": (written / wall if wall > 0 else 0.0),
-                "output": str(png_output_dir if png_save else final_video_path)}
+                "output": str(png_output_dir if png_save else final_video_path),
+                "max_memory_allocated": max_alloc,
+                "max_memory_reserved": max_reserved}
 
     # ------------------------------------------------------------------ #
     # Streaming (chunk by chunk, causal)                                 #

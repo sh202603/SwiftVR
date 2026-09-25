@@ -3,8 +3,8 @@
 Adapted from the ``WanTransformer3DModel`` (Wan2.2-TI2V) implementation in
 Hugging Face ``diffusers`` (Apache-2.0). The mask-free shifted-window
 self-attention processor and the multi-backend dense-attention dispatcher are
-specific to SwiftVR; the same checkpoint runs bit-identically across PyTorch SDPA,
-FlashAttention-2/3, SageAttention and xFormers.
+specific to SwiftVR; the same checkpoint runs across PyTorch SDPA (incl. its
+cuDNN kernel), FlashAttention-2/3, SageAttention and xFormers.
 """
 
 from __future__ import annotations
@@ -41,8 +41,19 @@ logger = logging.get_logger(__name__)
 # --------------------------------------------------------------------------- #
 
 _AVAILABLE_BACKENDS: set = {"sdpa"}
-_BACKEND_PRIORITY = ("flash_attn_3", "flash_attn_2", "sageattention", "sdpa", "xformers")
+_BACKEND_PRIORITY = ("flash_attn_3", "flash_attn_2", "sageattention", "cudnn", "sdpa", "xformers")
 _ATTN_BACKEND: Optional[str] = None
+
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    # PyTorch's cuDNN fused attention. Kept as an ordered preference list so
+    # that shapes/GPUs cuDNN cannot handle fall back to the other SDPA kernels.
+    _CUDNN_SDPA_PRIORITY = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                            SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+    if torch.backends.cudnn.is_available():
+        _AVAILABLE_BACKENDS.add("cudnn")
+except Exception:
+    _CUDNN_SDPA_PRIORITY = None
 
 try:
     from flash_attn_interface import flash_attn_func as _fa3_func
@@ -121,6 +132,13 @@ def _dense_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tens
 
     if backend == "xformers" and _xformers_mea is not None:
         return _xformers_mea(q, k, v, attn_bias=None)
+
+    if backend == "cudnn" and _CUDNN_SDPA_PRIORITY is not None:
+        with sdpa_kernel(_CUDNN_SDPA_PRIORITY, set_priority=True):
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                attn_mask=None, dropout_p=0.0, is_causal=False)
+        return out.transpose(1, 2)
 
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
@@ -212,15 +230,22 @@ class _WindowRuntimeMetaCache:
     def get(cls, T, H, W, wh, ww, do_shift, prefer_front, device):
         key = (T, H, W, wh, ww, bool(do_shift), bool(prefer_front), device.type, device.index)
         if key not in cls._store:
-            lin = _WindowIndexCache.get(T, H, W, wh, ww, do_shift, device)
-            Nw, Lw = lin.shape
-            THW = T * H * W
-            owner_cpu = cls._build_owner_pos_cpu(lin, prefer_front, THW)
-            cls._store[key] = _WindowRuntimeMeta(
-                lin_flat=lin.reshape(-1).contiguous(),
-                owner_pos=owner_cpu.to(device=device, non_blocking=True),
-                Nw=int(Nw), Lw=int(Lw), THW=int(THW))
+            cls._build(key, T, H, W, wh, ww, do_shift, prefer_front, device)
         return cls._store[key]
+
+    @classmethod
+    @torch.compiler.disable
+    def _build(cls, key, T, H, W, wh, ww, do_shift, prefer_front, device):
+        # Kept out of torch.compile graphs: the owner map is built with CPU ops,
+        # which Inductor would compile with the host C++ compiler (MSVC on Windows).
+        lin = _WindowIndexCache.get(T, H, W, wh, ww, do_shift, device)
+        Nw, Lw = lin.shape
+        THW = T * H * W
+        owner_cpu = cls._build_owner_pos_cpu(lin, prefer_front, THW)
+        cls._store[key] = _WindowRuntimeMeta(
+            lin_flat=lin.reshape(-1).contiguous(),
+            owner_pos=owner_cpu.to(device=device, non_blocking=True),
+            Nw=int(Nw), Lw=int(Lw), THW=int(THW))
 
     @classmethod
     def clear(cls):
@@ -349,9 +374,13 @@ class WanAttnProcessor:
                 backend=self._attention_backend, parallel_config=self._parallel_config)
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        hidden_states = dispatch_attention_fn(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
-            backend=self._attention_backend, parallel_config=self._parallel_config)
+        if attention_mask is None:
+            # same backend as the self-attention windows
+            hidden_states = _dense_attn(query, key, value)
+        else:
+            hidden_states = dispatch_attention_fn(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
+                backend=self._attention_backend, parallel_config=self._parallel_config)
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
 
         if hidden_states_img is not None:
@@ -396,40 +425,61 @@ class WanAttention(torch.nn.Module, AttentionModuleMixin):
         self.fused_projections = False
         self.set_processor(processor)
 
+    @staticmethod
+    def _fuse_linears(*linears):
+        w = torch.cat([m.weight.data for m in linears])
+        b = torch.cat([m.bias.data for m in linears])
+        out_f, in_f = w.shape
+        with torch.device("meta"):
+            fused = nn.Linear(in_f, out_f, bias=True)
+        fused.load_state_dict({"weight": w, "bias": b}, strict=True, assign=True)
+        return fused
+
+    @staticmethod
+    def _split_linear(fused, n):
+        out = []
+        for w, b in zip(fused.weight.data.chunk(n), fused.bias.data.chunk(n)):
+            out_f, in_f = w.shape
+            with torch.device("meta"):
+                m = nn.Linear(in_f, out_f, bias=True)
+            m.load_state_dict({"weight": w.clone(), "bias": b.clone()}, strict=True, assign=True)
+            out.append(m)
+        return out
+
+    @torch.no_grad()
     def fuse_projections(self):
+        """Replace the separate projections with fused ones. The unfused
+        modules are dropped (set to ``None``) so their weights are not kept
+        twice on the GPU (~2.6 GiB for the SwiftVR DiT)."""
         if self.fused_projections:
             return
 
         if self.cross_attention_dim_head is None:
-            w = torch.cat([self.to_q.weight.data, self.to_k.weight.data, self.to_v.weight.data])
-            b = torch.cat([self.to_q.bias.data, self.to_k.bias.data, self.to_v.bias.data])
-            out_f, in_f = w.shape
-            with torch.device("meta"):
-                self.to_qkv = nn.Linear(in_f, out_f, bias=True)
-            self.to_qkv.load_state_dict({"weight": w, "bias": b}, strict=True, assign=True)
+            self.to_qkv = self._fuse_linears(self.to_q, self.to_k, self.to_v)
+            self.to_q = self.to_k = self.to_v = None
         else:
-            w = torch.cat([self.to_k.weight.data, self.to_v.weight.data])
-            b = torch.cat([self.to_k.bias.data, self.to_v.bias.data])
-            out_f, in_f = w.shape
-            with torch.device("meta"):
-                self.to_kv = nn.Linear(in_f, out_f, bias=True)
-            self.to_kv.load_state_dict({"weight": w, "bias": b}, strict=True, assign=True)
+            self.to_kv = self._fuse_linears(self.to_k, self.to_v)
+            self.to_k = self.to_v = None
 
         if self.added_kv_proj_dim is not None:
-            w = torch.cat([self.add_k_proj.weight.data, self.add_v_proj.weight.data])
-            b = torch.cat([self.add_k_proj.bias.data, self.add_v_proj.bias.data])
-            out_f, in_f = w.shape
-            with torch.device("meta"):
-                self.to_added_kv = nn.Linear(in_f, out_f, bias=True)
-            self.to_added_kv.load_state_dict({"weight": w, "bias": b}, strict=True, assign=True)
+            self.to_added_kv = self._fuse_linears(self.add_k_proj, self.add_v_proj)
+            self.add_k_proj = self.add_v_proj = None
 
         self.fused_projections = True
 
     @torch.no_grad()
     def unfuse_projections(self):
-        for attr in ("to_qkv", "to_kv", "to_added_kv"):
-            if hasattr(self, attr):
-                delattr(self, attr)
+        if not self.fused_projections:
+            return
+        if self.cross_attention_dim_head is None:
+            self.to_q, self.to_k, self.to_v = self._split_linear(self.to_qkv, 3)
+            del self.to_qkv
+        else:
+            self.to_k, self.to_v = self._split_linear(self.to_kv, 2)
+            del self.to_kv
+        if self.added_kv_proj_dim is not None:
+            self.add_k_proj, self.add_v_proj = self._split_linear(self.to_added_kv, 2)
+            del self.to_added_kv
         self.fused_projections = False
 
     def forward(self, hidden_states, encoder_hidden_states=None,
@@ -743,16 +793,31 @@ class WanTransformer3DModel(
         self._enable_swa = enable_swa
         self._self_attn_window_hw = self_attn_window_hw
 
-    def prepare_for_inference(self, attention_backend="auto", use_torch_compile=False, compile_mode="default"):
+    def prepare_for_inference(self, attention_backend="auto", use_torch_compile=False, compile_mode="default",
+                              fp8=False):
         backend = set_attention_backend(attention_backend)
         logger.info(f"Using attention backend: {backend} "
                     f"(available: {list_available_attention_backends()})")
         enable_shifted_window_self_attention(self, window_hw=self._self_attn_window_hw)
+        if fp8:
+            # after QKV fusion (FP8 copies of the fused projections), before compile
+            from .fp8 import convert_blocks_to_fp8
+            n = convert_blocks_to_fp8(self)
+            logger.info(f"FP8 DiT: {n} block GEMMs converted")
         if use_torch_compile:
             compile_transformer_blocks(self, mode=compile_mode)
         _WindowIndexCache.clear()
         _WindowRuntimeMetaCache.clear()
         self.eval()
+
+    def warm_window_cache(self, thw, device):
+        """Build the window index maps for a (T, H, W) token grid outside the
+        (possibly compiled) blocks."""
+        T_, H_, W_ = thw
+        wh, ww = min(self._self_attn_window_hw[0], H_), min(self._self_attn_window_hw[1], W_)
+        for do_shift in (False, True):
+            _WindowRuntimeMetaCache.get(T_, H_, W_, wh, ww, do_shift=do_shift,
+                                        prefer_front=not do_shift, device=device)
 
     @torch.inference_mode()
     def forward(self, hidden_states, timestep, encoder_hidden_states,
@@ -788,12 +853,7 @@ class WanTransformer3DModel(
             encoder_hidden_states = torch.cat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
         thw_global = (ppf, pph, ppw)
-        cfg_wh, cfg_ww = self._self_attn_window_hw
-        dev = hidden_states.device
-        _WindowRuntimeMetaCache.get(ppf, pph, ppw, min(cfg_wh, pph), min(cfg_ww, ppw),
-                                    do_shift=False, prefer_front=True, device=dev)
-        _WindowRuntimeMetaCache.get(ppf, pph, ppw, min(cfg_wh, pph), min(cfg_ww, ppw),
-                                    do_shift=True, prefer_front=False, device=dev)
+        self.warm_window_cache(thw_global, hidden_states.device)
 
         for blk in self.blocks:
             underlying = getattr(blk, "_orig_mod", blk)

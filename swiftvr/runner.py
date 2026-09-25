@@ -4,6 +4,7 @@ Overlaps host reading, host->device copy, GPU restoration and disk writing on
 separate threads/CUDA streams to maximise sustained throughput.
 """
 
+import sys
 import time
 import queue
 import threading
@@ -18,7 +19,7 @@ from .io import (
     iter_video_clips_fixed_scheme,
     preprocess_clip_uint8,
     crop_spatial_padding_ntchw,
-    ntchw_to_uint8_frames,
+    ntchw_to_uint8_thwc,
     append_chunk_to_png_dir,
     open_stream_video_writer,
 )
@@ -29,9 +30,12 @@ def cuda_synchronize():
         torch.cuda.synchronize()
 
 
-def enable_max_fps_runtime(allow_tf32=True):
+def enable_max_fps_runtime(allow_tf32=True, cudnn_benchmark=False):
+    # cudnn.benchmark re-tunes every new conv shape (chunk types and frame
+    # batches produce several) and its trial workspaces can add several GiB of
+    # peak memory, so it is opt-in.
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
         torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
         torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
     try:
@@ -64,6 +68,40 @@ class _Item:
 
 def _stop_item():
     return _Item(clip_idx=-1, stop=True)
+
+
+def _fmt_duration(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class _Progress:
+    """Single-line progress (``\\r``-overwritten) based on frames written."""
+
+    def __init__(self, total, enabled):
+        self.total = max(1, int(total))
+        self.enabled = enabled
+        self.t0 = time.perf_counter()
+        self._last_len = 0
+
+    def update(self, done, gpu_fps):
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self.t0
+        fps = done / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - done) / fps if fps > 0 else 0.0
+        line = (f"  {100.0 * done / self.total:5.1f}% {done}/{self.total} frames | "
+                f"{fps:.2f} fps (gpu {gpu_fps:.2f}) | {_fmt_duration(elapsed)} < ETA {_fmt_duration(eta)}")
+        pad = " " * max(0, self._last_len - len(line))
+        self._last_len = len(line)
+        sys.stdout.write("\r" + line + pad)
+        sys.stdout.flush()
+
+    def close(self):
+        if self.enabled and self._last_len:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 def run_pipeline(
@@ -158,7 +196,7 @@ def run_pipeline(
             record_error("h2d")
 
     def _start_d2h(item):
-        if item.rgb_out_gpu is None or item.rgb_out_gpu.shape[1] == 0:
+        if item.rgb_out_gpu is None or item.rgb_out_gpu.shape[0] == 0:
             item.rgb_out_cpu = None
             return item
         try:
@@ -223,22 +261,13 @@ def run_pipeline(
                     prev_dit_out_cpu = z_bcfhw[:, :, -n_lat:].detach().cpu().clone()
 
                 rgb_out = tae_stream.decode_chunk_fixed(z_ntchw, spec)
-                if rgb_out is not None and rgb_out.shape[1] > 0:
-                    item.rgb_out_gpu = crop_spatial_padding_ntchw(rgb_out, pad_h, pad_w).detach()
-                else:
-                    item.rgb_out_gpu = None
+                item.rgb_out_gpu = ntchw_to_uint8_thwc(crop_spatial_padding_ntchw(rgb_out, pad_h, pad_w))
 
                 if use_cuda:
                     t_end.record(torch.cuda.current_stream(device=device))
                     item.timings["gpu"] = _event_elapsed_seconds(t_start, t_end)
                 else:
                     item.timings["gpu"] = time.perf_counter() - t0
-
-                if verbose:
-                    out_n = 0 if item.rgb_out_gpu is None else item.rgb_out_gpu.shape[1]
-                    fps = out_n / item.timings["gpu"] if item.timings["gpu"] > 0 else 0.0
-                    print(f"  [gpu] {spec.ctype.value:6s} clip {item.clip_idx}: "
-                          f"out={out_n}f time={item.timings['gpu']:.3f}s gpu_fps={fps:.2f}")
 
                 item.gpu_rgb = None
                 q_write.put(_start_d2h(item))
@@ -262,24 +291,27 @@ def run_pipeline(
                 item.rgb_out_gpu = None
 
                 n_written = n_consumed = 0
-                if item.rgb_out_cpu is not None and item.rgb_out_cpu.shape[1] > 0:
+                if item.rgb_out_cpu is not None and item.rgb_out_cpu.shape[0] > 0:
+                    frames = item.rgb_out_cpu.numpy()
                     if png_save:
                         n_written, n_consumed = append_chunk_to_png_dir(
-                            item.rgb_out_cpu, png_output_dir, start_idx=frames_state["next_idx"],
+                            frames, png_output_dir, start_idx=frames_state["next_idx"],
                             frame_names=png_frame_names, written_once=png_written_once)
                     else:
                         if writer is None:
                             writer = open_stream_video_writer(
                                 final_output_path, fps=source_fps, video_format=save_format,
                                 preset=ffmpeg_preset, quality=quality)
-                        frames = ntchw_to_uint8_frames(item.rgb_out_cpu)
-                        if frames is not None:
-                            for frame in frames:
-                                writer.append_data(frame)
-                            n_written = n_consumed = int(frames.shape[0])
+                        for frame in frames:
+                            writer.append_data(frame)
+                        n_written = n_consumed = int(frames.shape[0])
 
                 frames_state["next_idx"] += n_consumed
                 frames_state["saved"] += n_written
+
+                gpu_t = item.timings.get("gpu", 0.0)
+                gpu_fps = n_consumed / gpu_t if gpu_t > 0 else 0.0
+                progress.update(frames_state["next_idx"], gpu_fps)
         except Exception:
             record_error("writer")
         finally:
@@ -293,11 +325,13 @@ def run_pipeline(
         threading.Thread(target=writer_worker, name="writer", daemon=True),
     ]
     t0 = time.perf_counter()
+    progress = _Progress(total_frames, verbose)
     for th in threads:
         th.start()
     for th in threads:
         th.join()
     wall_time = time.perf_counter() - t0
+    progress.close()
 
     if stage_errors:
         name, err = stage_errors[0]

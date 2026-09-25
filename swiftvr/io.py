@@ -180,11 +180,12 @@ def crop_spatial_padding_ntchw(video, pad_h=0, pad_w=0):
     return video
 
 
-def ntchw_to_uint8_frames(video):
+def ntchw_to_uint8_thwc(video):
+    """``[1, T, 3, H, W]`` float in [0, 1] -> ``[T, H, W, 3]`` uint8 on the same
+    device. Converting on the GPU halves the D2H payload vs bf16."""
     if video is None or video.numel() == 0 or video.shape[1] == 0:
         return None
-    video = video[0].permute(0, 2, 3, 1).contiguous()
-    return (video * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    return (video[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).to(torch.uint8).contiguous()
 
 
 def quality_to_crf(quality: int) -> int:
@@ -196,8 +197,11 @@ def open_stream_video_writer(output_path, fps=8, video_format="", preset="", qua
     extra = ["-preset", str(preset)] if preset else []
     crf = quality_to_crf(quality)
     pix = "yuv444p" if video_format == "yuv444p" else "yuv420p"
+    # libx265 logs through its own logger (not ffmpeg's -loglevel); silence its
+    # banner and final statistics.
     return imageio.get_writer(output_path, fps=fps, codec="libx265", pixelformat=pix,
-                             macro_block_size=None, ffmpeg_params=["-crf", str(crf)] + extra)
+                             macro_block_size=None, ffmpeg_log_level="error",
+                             ffmpeg_params=["-crf", str(crf), "-x265-params", "log-level=error"] + extra)
 
 
 def _normalize_png_name(name: str) -> str:
@@ -205,12 +209,12 @@ def _normalize_png_name(name: str) -> str:
     return name if name.lower().endswith(".png") else f"{name}.png"
 
 
-def append_chunk_to_png_dir(video_ntchw, output_dir, start_idx=0, pad_h=0, pad_w=0,
+def append_chunk_to_png_dir(frames, output_dir, start_idx=0,
                             frame_names: Optional[List[str]] = None,
                             written_once: Optional[set] = None):
+    """Write ``frames`` (``[T, H, W, 3]`` uint8 numpy) as PNGs."""
     os.makedirs(output_dir, exist_ok=True)
-    frames = ntchw_to_uint8_frames(crop_spatial_padding_ntchw(video_ntchw, pad_h, pad_w))
-    if frames is None:
+    if frames is None or len(frames) == 0:
         return 0, 0
 
     saved = 0

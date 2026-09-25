@@ -5,6 +5,8 @@ space and the DiT latent space. The memory-block topology is adapted from TAEHV
 (https://github.com/madebyollin/taehv, MIT License).
 """
 
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,7 +37,7 @@ class MemBlock(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x, past):
-        return self.act(self.conv(torch.cat([x, past], 1)) + self.skip(x))
+        return self.act(self.conv(torch.cat([x, past], 1)).add_(self.skip(x)))
 
 
 class TPool(nn.Module):
@@ -123,34 +125,37 @@ class ReAE(nn.Module):
         n_f = [256 * width_mult, 128 * width_mult, 64 * width_mult, 64]
         self.frames_to_trim = 2 ** sum(decoder_time_upscale) - 1
 
-        self.decoder = nn.Sequential(
-            Clamp(),
-            conv(self.latent_channels, n_f[0]),
-            nn.ReLU(inplace=True),
-            MemBlock(n_f[0], n_f[0]),
-            MemBlock(n_f[0], n_f[0]),
-            MemBlock(n_f[0], n_f[0]),
-            nn.Upsample(scale_factor=2 if decoder_space_upscale[0] else 1),
-            TGrow(n_f[0], 1),
-            conv(n_f[0], n_f[1], bias=False),
+        # TGrow is spatially pointwise, so it commutes with nearest upsampling and
+        # runs before it (at 1/4 of the pixels). Layers are listed in execution
+        # order; the numeric names keep the original checkpoint keys.
+        self.decoder = nn.Sequential(OrderedDict([
+            ("0", Clamp()),
+            ("1", conv(self.latent_channels, n_f[0])),
+            ("2", nn.ReLU(inplace=True)),
+            ("3", MemBlock(n_f[0], n_f[0])),
+            ("4", MemBlock(n_f[0], n_f[0])),
+            ("5", MemBlock(n_f[0], n_f[0])),
+            ("7", TGrow(n_f[0], 1)),
+            ("6", nn.Upsample(scale_factor=2 if decoder_space_upscale[0] else 1)),
+            ("8", conv(n_f[0], n_f[1], bias=False)),
 
-            MemBlock(n_f[1], n_f[1]),
-            MemBlock(n_f[1], n_f[1]),
-            MemBlock(n_f[1], n_f[1]),
-            nn.Upsample(scale_factor=2 if decoder_space_upscale[1] else 1),
-            TGrow(n_f[1], 2 if decoder_time_upscale[0] else 1),
-            conv(n_f[1], n_f[2], bias=False),
+            ("9", MemBlock(n_f[1], n_f[1])),
+            ("10", MemBlock(n_f[1], n_f[1])),
+            ("11", MemBlock(n_f[1], n_f[1])),
+            ("13", TGrow(n_f[1], 2 if decoder_time_upscale[0] else 1)),
+            ("12", nn.Upsample(scale_factor=2 if decoder_space_upscale[1] else 1)),
+            ("14", conv(n_f[1], n_f[2], bias=False)),
 
-            MemBlock(n_f[2], n_f[2]),
-            MemBlock(n_f[2], n_f[2]),
-            MemBlock(n_f[2], n_f[2]),
-            nn.Upsample(scale_factor=2 if decoder_space_upscale[2] else 1),
-            TGrow(n_f[2], 2 if decoder_time_upscale[1] else 1),
-            conv(n_f[2], n_f[3], bias=False),
+            ("15", MemBlock(n_f[2], n_f[2])),
+            ("16", MemBlock(n_f[2], n_f[2])),
+            ("17", MemBlock(n_f[2], n_f[2])),
+            ("19", TGrow(n_f[2], 2 if decoder_time_upscale[1] else 1)),
+            ("18", nn.Upsample(scale_factor=2 if decoder_space_upscale[2] else 1)),
+            ("20", conv(n_f[2], n_f[3], bias=False)),
 
-            nn.ReLU(inplace=True),
-            conv(n_f[3], self.image_channels * self.patch_size ** 2),
-        )
+            ("21", nn.ReLU(inplace=True)),
+            ("22", conv(n_f[3], self.image_channels * self.patch_size ** 2)),
+        ]))
 
         if checkpoint_path is not None:
             self.load_state_dict(load_file(checkpoint_path, device="cpu"), strict=True)

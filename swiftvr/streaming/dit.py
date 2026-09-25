@@ -85,6 +85,7 @@ def _dit_forward_chunk(transformer, chunk, temb, tp, enc_hs, t_off=0):
     hs = transformer.patch_embedding(chunk).flatten(2).transpose(1, 2)
 
     thw_global = (ppf, pph, ppw)
+    transformer.warm_window_cache(thw_global, hs.device)
     for i, blk in enumerate(transformer.blocks):
         underlying = getattr(blk, "_orig_mod", blk)
         if hasattr(underlying, "attn1"):
