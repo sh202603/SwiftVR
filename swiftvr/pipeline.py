@@ -30,7 +30,8 @@ from .io import (
     CROP_LQ_MULTIPLE_PAD_ALIGN,
     UPSCALE_MARGIN,
 )
-from .runner import run_pipeline, enable_max_fps_runtime
+from .runner import run_pipeline, restore_chunk, enable_max_fps_runtime
+from .streaming.chunk import build_chunk_specs
 from .resume import tile_video_path, write_done_marker
 from . import tiling
 
@@ -356,6 +357,86 @@ class SwiftVRPipeline:
             plan, quality=quality, save_format=save_format, ffmpeg_preset=ffmpeg_preset,
             output_height=output_height, device=self.device, verbose=verbose, t_start=t_start,
             peak_allocated=peak_alloc, peak_reserved=peak_reserved)
+
+    # ------------------------------------------------------------------ #
+    # One in-memory clip (frame-count preserving)                        #
+    # ------------------------------------------------------------------ #
+
+    @torch.inference_mode()
+    def restore_clip(self, frames_uint8: torch.Tensor, *, upscale: int = 4, clip_len: int = 24,
+                     min_frames: Optional[int] = None) -> torch.Tensor:
+        """Restore one clip held in memory.
+
+        ``frames_uint8``: ``[T, H, W, 3]`` uint8 on any device, ``T >= 1``.
+        Returns ``[T, H * upscale, W * upscale, 3]`` uint8 on ``self.device``,
+        exactly ``T`` frames.
+
+        The clip is padded by repeating its last frame up to the fixed chunk
+        protocol's ``4k + 1`` length and to at least ``min_frames`` (default
+        ``clip_len + 1``), restored chunk by chunk with the same code as
+        ``restore_video`` (``runner.restore_chunk``), and the padding is dropped.
+        The ``min_frames`` floor exists because a clip of up to ``clip_len + 4``
+        frames is a single LAST chunk whose DiT input always holds
+        ``clip_len // 4 + 1`` latents: a shorter clip has the missing latents
+        filled with zeros, while at ``clip_len + 1`` frames all of them come from
+        (repeated) real frames at the same DiT cost. The input is not cropped
+        to a multiple of 8; the upscaled frame is zero-padded to a multiple of
+        32 internally. Temporal overlap is not used (``dit_overlap`` 0).
+        """
+        if clip_len % 4 != 0:
+            raise ValueError(f"clip_len must be a multiple of 4, got {clip_len}")
+        if frames_uint8.ndim != 4 or frames_uint8.shape[-1] != 3 or frames_uint8.dtype != torch.uint8:
+            raise ValueError("frames_uint8 must be a [T, H, W, 3] uint8 tensor, got "
+                             f"{tuple(frames_uint8.shape)} {frames_uint8.dtype}")
+        t_real = int(frames_uint8.shape[0])
+        if t_real < 1:
+            raise ValueError("frames_uint8 must hold at least one frame")
+        if not self._prepared:
+            self.to()
+        if min_frames is None:
+            min_frames = clip_len + 1
+
+        frames = frames_uint8.to(self.device)
+        t_pad = 4 * ((max(t_real, int(min_frames)) - 1 + 3) // 4) + 1  # smallest 4k+1 >= max(...)
+        if t_pad > t_real:
+            frames = torch.cat([frames, frames[-1:].expand(t_pad - t_real, -1, -1, -1)], dim=0)
+        frames = frames.contiguous()
+
+        lq_h, lq_w = int(frames.shape[1]), int(frames.shape[2])
+        out_h, out_w, pad_h, pad_w = self._target_size(lq_h, lq_w, None, upscale)
+
+        self.tae_stream.reset()
+        self.dit_stream.reset()
+        self.dit_stream.overlap = 0
+        n_lat = clip_len // 4
+        prev_lq_latents_cpu = None
+        # Preallocated (no torch.cat copy of the whole upscaled clip at the end).
+        # Output frames are appended in order, not placed at spec.frame_start:
+        # the first decode drops the decoder's causal-padding frames and the
+        # LAST chunk's encoder re-adds them, so chunk output counts differ from
+        # their input counts while the total is preserved.
+        out = torch.empty((t_pad, out_h, out_w, 3), dtype=torch.uint8, device=self.device)
+        pos = 0
+        for spec in build_chunk_specs(t_pad, clip_len):
+            chunk = frames[spec.frame_start:spec.frame_start + spec.frame_count]
+            rgb_out, prev_lq_latents_cpu = restore_chunk(
+                spec, chunk,
+                tae_stream=self.tae_stream, dit_stream=self.dit_stream, prompt_emb=self.prompt_emb,
+                device=self.device, dtype=self.dtype, n_lat=n_lat,
+                prev_lq_latents_cpu=prev_lq_latents_cpu,
+                out_h=out_h, out_w=out_w, pad_h=pad_h, pad_w=pad_w,
+                upscale_mode=self.upscale_mode)
+            if rgb_out is None:
+                continue
+            n_out = int(rgb_out.shape[0])
+            if pos + n_out > t_pad:
+                raise RuntimeError(f"restore_clip produced more than {t_pad} frames for a {t_pad}-frame padded clip")
+            out[pos:pos + n_out] = rgb_out
+            pos += n_out
+            del rgb_out
+        if pos != t_pad:
+            raise RuntimeError(f"restore_clip produced {pos} frames for a {t_pad}-frame padded clip")
+        return out[:t_real]
 
     # ------------------------------------------------------------------ #
     # Streaming (chunk by chunk, causal)                                 #

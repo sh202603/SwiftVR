@@ -156,6 +156,30 @@ Tunable knobs include:
 * `quality`: 0–100, mapped to x265 CRF
 * `queue_size`: pipeline queue size
 
+### One clip in memory
+
+`restore_clip` restores a clip that is already in memory and returns exactly
+as many frames as it was given, for any length from one frame up. It exists
+for callers that upscale many short clips (such as
+[jasna](https://github.com/sh202603/jasna)'s secondary restoration, which
+hands over the mosaic crops of one detection track at a time).
+
+```python
+lq = ...                                            # [T, H, W, 3] uint8, CPU or CUDA
+hq = pipe.restore_clip(lq, upscale=4)               # [T, 4H, 4W, 3] uint8 on pipe.device
+```
+
+The clip goes through the same fixed chunk protocol and code as
+`restore_video`, so a `4k+1`-frame clip gives the same frames as the file path
+does. Shorter or other lengths are padded by repeating the last frame: up to
+the protocol's `4k+1` and to at least `clip_len + 1` frames (the `min_frames`
+argument). The floor matters for short clips: anything up to `clip_len + 4`
+frames is a single LAST chunk whose DiT input always holds `clip_len / 4 + 1`
+latents, and without the floor the missing latents would be zeros, while with
+it they come from (repeated) real frames at the same DiT cost. The input is
+not cropped to a multiple of 8; temporal overlap is not used. `clip_len` is
+the same knob as for `restore_video`.
+
 ### Streaming
 
 Causal, chunk-by-chunk restoration without future frames.
