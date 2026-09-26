@@ -70,6 +70,40 @@ def _stop_item():
     return _Item(clip_idx=-1, stop=True)
 
 
+def restore_chunk(spec, gpu_rgb, *, tae_stream, dit_stream, prompt_emb, device, dtype,
+                  n_lat, prev_lq_latents_cpu, out_h, out_w, pad_h, pad_w, upscale_mode,
+                  trim=None, pad_mode="constant"):
+    """Restore one chunk of the fixed causal protocol.
+
+    ``gpu_rgb`` is ``[T, H, W, 3]`` uint8 on ``device`` with exactly
+    ``spec.frame_count`` frames. ``prev_lq_latents_cpu`` is the tail (``n_lat``
+    latents) of the previous FIRST/MIDDLE chunk's LQ latents, which the LAST
+    chunk is left-padded with (``None`` before the first chunk).
+
+    Returns ``(rgb_out, prev_lq_latents_cpu)``: the restored frames as
+    ``[T, out_h, out_w, 3]`` uint8 on ``device`` and the updated padding state.
+    Shared by the offline runner and ``SwiftVRPipeline.restore_clip`` so the two
+    paths cannot drift apart.
+    """
+    clip_rgb = preprocess_clip_uint8(
+        gpu_rgb, out_h=out_h, out_w=out_w, mode=upscale_mode,
+        pad_h=pad_h, pad_w=pad_w, dtype=dtype, trim=trim, pad_mode=pad_mode)
+    z = tae_stream.encode_chunk_fixed(clip_rgb, spec)
+
+    if spec.ctype == ChunkType.LAST:
+        z_ntchw = dit_stream.denoise_last_chunk(
+            z, spec, prompt_emb, prev_lq_latents_cpu, n_lat, device, dtype)
+    else:
+        z_bcfhw = z.permute(0, 2, 1, 3, 4).contiguous()
+        z_den = dit_stream.denoise(z_bcfhw, prompt_emb)
+        z_ntchw = z_den.permute(0, 2, 1, 3, 4).contiguous()
+        prev_lq_latents_cpu = z_bcfhw[:, :, -n_lat:].detach().cpu().clone()
+
+    rgb_out = tae_stream.decode_chunk_fixed(z_ntchw, spec)
+    rgb_out = ntchw_to_uint8_thwc(crop_spatial_padding_ntchw(rgb_out, pad_h, pad_w))
+    return rgb_out, prev_lq_latents_cpu
+
+
 def _fmt_duration(seconds):
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
@@ -251,7 +285,7 @@ def run_pipeline(
             tae_stream.reset()
             dit_stream.reset()
             n_lat = clip_len // 4
-            prev_dit_out_cpu = None
+            prev_lq_latents_cpu = None
 
             while True:
                 item = get(q_gpu)
@@ -262,7 +296,6 @@ def run_pipeline(
 
                 if item.h2d_event is not None:
                     torch.cuda.current_stream(device=device).wait_event(item.h2d_event)
-                spec = item.spec
 
                 if use_cuda:
                     t_start = torch.cuda.Event(enable_timing=True)
@@ -271,22 +304,13 @@ def run_pipeline(
                 else:
                     t0 = time.perf_counter()
 
-                clip_rgb = preprocess_clip_uint8(
-                    item.gpu_rgb, out_h=out_h, out_w=out_w, mode=upscale_mode,
-                    pad_h=pad_h, pad_w=pad_w, dtype=dtype, trim=trim, pad_mode=pad_mode)
-                z = tae_stream.encode_chunk_fixed(clip_rgb, spec)
-
-                if spec.ctype == ChunkType.LAST:
-                    z_ntchw = dit_stream.denoise_last_chunk(
-                        z, spec, prompt_emb, prev_dit_out_cpu, n_lat, device, dtype)
-                else:
-                    z_bcfhw = z.permute(0, 2, 1, 3, 4).contiguous()
-                    z_den = dit_stream.denoise(z_bcfhw, prompt_emb)
-                    z_ntchw = z_den.permute(0, 2, 1, 3, 4).contiguous()
-                    prev_dit_out_cpu = z_bcfhw[:, :, -n_lat:].detach().cpu().clone()
-
-                rgb_out = tae_stream.decode_chunk_fixed(z_ntchw, spec)
-                item.rgb_out_gpu = ntchw_to_uint8_thwc(crop_spatial_padding_ntchw(rgb_out, pad_h, pad_w))
+                item.rgb_out_gpu, prev_lq_latents_cpu = restore_chunk(
+                    item.spec, item.gpu_rgb,
+                    tae_stream=tae_stream, dit_stream=dit_stream, prompt_emb=prompt_emb,
+                    device=device, dtype=dtype, n_lat=n_lat,
+                    prev_lq_latents_cpu=prev_lq_latents_cpu,
+                    out_h=out_h, out_w=out_w, pad_h=pad_h, pad_w=pad_w,
+                    upscale_mode=upscale_mode, trim=trim, pad_mode=pad_mode)
 
                 if use_cuda:
                     t_end.record(torch.cuda.current_stream(device=device))
@@ -296,7 +320,6 @@ def run_pipeline(
 
                 item.gpu_rgb = None
                 put(q_write, _start_d2h(item))
-                del clip_rgb, z, z_ntchw, rgb_out
 
             put(q_write, _stop_item())
         except Exception:
