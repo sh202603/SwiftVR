@@ -22,14 +22,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-import decord
-
 from .io import (
     CROP_LQ_MULTIPLE,
     CROP_LQ_MULTIPLE_PAD_ALIGN,
     UPSCALE_MARGIN,
     VIDEO_EXTS,
-    _decord_batch_to_torch,
+    FfmpegFrameReader,
     append_chunk_to_png_dir,
     get_video_info,
     list_image_frames,
@@ -40,6 +38,7 @@ from .resume import (
     TEMP_DIR_NAME,
     TILE_DIR_PREFIX,
     build_resume_manifest,
+    count_video_frames,
     input_fingerprint,
     list_stale_tile_dirs,
     prepare_resume_dir,
@@ -409,25 +408,25 @@ def stitch_tiles(plan: TilePlan, *, quality=85, save_format="", ffmpeg_preset=""
     n_chunk = _stitch_chunk_frames(final_h, final_w, tile_out, device, chunk_frames)
 
     readers = []
-    vr = None
     writer = None
     written = 0
     png_written_once = set()
     try:
         for i in range(plan.num_tiles):
-            vr = decord.VideoReader(tile_video_path(plan.tile_dir, i))
-            if len(vr) != total:
-                raise RuntimeError(f"Tile video {i + 1} has {len(vr)} frames, expected {total}; "
+            path = tile_video_path(plan.tile_dir, i)
+            n_frames = count_video_frames(path)
+            if n_frames != total:
+                raise RuntimeError(f"Tile video {i + 1} has {n_frames} frames, expected {total}; "
                                    "the tiled run is incomplete, refusing to write a broken output.")
-            readers.append(vr)
+            readers.append(FfmpegFrameReader(path))
 
         progress = _Progress(total, verbose, "stitch ")
         for start in range(0, total, n_chunk):
             n = min(n_chunk, total - start)
             t0 = time.perf_counter()
             canvas = torch.zeros(n, final_h, final_w, 3, dtype=torch.float32, device=device)
-            for i, vr in enumerate(readers):
-                frames = _decord_batch_to_torch(vr.get_batch(list(range(start, start + n))))
+            for i, reader in enumerate(readers):
+                frames = reader.read(n)
                 if frames.shape[0] != n:
                     raise RuntimeError(f"Tile video {i + 1} ended early at frame {start + frames.shape[0]}"
                                        f"/{total}; refusing to write a broken output.")
@@ -465,9 +464,9 @@ def stitch_tiles(plan: TilePlan, *, quality=85, save_format="", ffmpeg_preset=""
     finally:
         if writer is not None:
             writer.close()
-        # decord has no close(); the files stay open until the readers are freed,
-        # and Windows cannot delete open files.
-        vr = None
+        # Stops the ffmpeg processes; Windows cannot delete the files they hold open.
+        for reader in readers:
+            reader.close()
         readers.clear()
     return written
 

@@ -1,6 +1,7 @@
 """Input/output utilities for SwiftVR: frame reading, GPU preprocessing and writing.
 
-Supports both video files (read with ``decord``) and image folders, and writes
+Supports both video files (probed with ``decord``, decoded by an ffmpeg
+subprocess) and image folders, and writes
 either an mp4 (libx265) or a PNG sequence.
 """
 
@@ -13,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import imageio
+import imageio_ffmpeg
 from PIL import Image
 
 import decord
@@ -78,12 +80,37 @@ def _crop_size_to_multiple(h: int, w: int, multiple: int) -> Tuple[int, int]:
     return crop_h, crop_w
 
 
-def _decord_batch_to_torch(frames):
-    if isinstance(frames, torch.Tensor):
-        return frames
-    if hasattr(frames, "asnumpy"):
-        return torch.from_numpy(frames.asnumpy())
-    return torch.as_tensor(frames)
+class FfmpegFrameReader:
+    """Sequential RGB frames of a video file, decoded by an ffmpeg subprocess.
+
+    Not decord: its reader keeps decoding ahead into RAM while the caller is
+    busy, ~600-7000 frames per reader depending on the file (3.7 GiB for a
+    720p HEVC input), and the eight tile readers of a stitch exhausted memory.
+    The pipe to ffmpeg bounds the read-ahead. Rotation metadata is ignored as
+    in decord; the frames and the frame count are identical to decord's."""
+
+    def __init__(self, path):
+        self._gen = imageio_ffmpeg.read_frames(
+            str(path), pix_fmt="rgb24", input_params=["-noautorotate"],
+            output_params=["-fps_mode", "passthrough", "-an", "-sn"])
+        self.width, self.height = next(self._gen)["size"]
+
+    def read(self, n: int) -> torch.Tensor:
+        """Up to ``n`` frames as a CPU ``[n, H, W, 3]`` uint8 tensor; fewer at the end."""
+        frames = []
+        for _ in range(n):
+            try:
+                buf = next(self._gen)
+            except StopIteration:
+                break
+            frames.append(np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width, 3))
+        if not frames:
+            return torch.empty(0, self.height, self.width, 3, dtype=torch.uint8)
+        return torch.from_numpy(np.stack(frames))
+
+    def close(self):
+        """Stops ffmpeg; Windows cannot delete a file it holds open."""
+        self._gen.close()
 
 
 def _read_image_chunk_uint8(paths: List[Path], crop_rect: Tuple[int, int, int, int]) -> torch.Tensor:
@@ -161,15 +188,17 @@ def iter_video_clips_fixed_scheme(
             chunk_paths = all_paths[spec.frame_start: spec.frame_start + spec.frame_count]
             yield spec, _read_image_chunk_uint8(chunk_paths, crop_rect)
     else:
+        # The chunks are consecutive, so a sequential reader suffices.
+        reader = FfmpegFrameReader(path)
         try:
-            decord.bridge.set_bridge("torch")
-        except Exception:
-            pass
-        vr = decord.VideoReader(uri=path.as_posix())
-        for spec in specs:
-            idx = list(range(spec.frame_start, spec.frame_start + spec.frame_count))
-            frames = _decord_batch_to_torch(vr.get_batch(idx))
-            yield spec, frames[:, y1:y2, x1:x2, :].contiguous()
+            for spec in specs:
+                frames = reader.read(spec.frame_count)
+                if frames.shape[0] != spec.frame_count:
+                    raise RuntimeError(f"{path} ended at frame {spec.frame_start + frames.shape[0]}, "
+                                       f"expected {total_frames} frames.")
+                yield spec, frames[:, y1:y2, x1:x2, :].contiguous()
+        finally:
+            reader.close()
 
 
 # --------------------------------------------------------------------------- #
