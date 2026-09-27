@@ -722,15 +722,17 @@ def enable_shifted_window_self_attention(model, window_hw=(16, 16)):
     repeated recompilation across transformer blocks.
     """
     proc = WanShiftWindow2DInferProcessor(window_hw=window_hw)
-
     for i, blk in enumerate(getattr(model, "blocks", [])):
-        underlying = getattr(blk, "_orig_mod", blk)
-        if hasattr(underlying, "attn1"):
-            underlying.attn1._do_shift = bool(i % 2 == 1)
-            if hasattr(underlying.attn1, "_layer_id"):
-                delattr(underlying.attn1, "_layer_id")
+        _prepare_block_attention(getattr(blk, "_orig_mod", blk), i, proc)
 
-    for _, m in model.named_modules():
+
+def _prepare_block_attention(blk, i, proc):
+    """``enable_shifted_window_self_attention`` for block ``i``."""
+    if hasattr(blk, "attn1"):
+        blk.attn1._do_shift = bool(i % 2 == 1)
+        if hasattr(blk.attn1, "_layer_id"):
+            delattr(blk.attn1, "_layer_id")
+    for m in blk.modules():
         if isinstance(m, WanAttention):
             m.fuse_projections()
             if not getattr(m, "is_cross_attention", False):
@@ -794,15 +796,36 @@ class WanTransformer3DModel(
         self._self_attn_window_hw = self_attn_window_hw
 
     def prepare_for_inference(self, attention_backend="auto", use_torch_compile=False, compile_mode="default",
-                              fp8=False):
+                              fp8=False, device=None, dtype=None):
+        """Fuse projections, install the shifted-window self-attention and
+        optionally convert the block GEMMs to FP8 / compile the blocks.
+
+        With ``device``/``dtype`` the model is moved there as part of this call,
+        one block at a time and each block prepared (and FP8-converted) right
+        after its move, so with ``fp8`` the bf16 weights of only one block are
+        ever on the device alongside the FP8 ones (moving the whole model first
+        would put the full ~9.3 GiB of bf16 weights there)."""
         backend = set_attention_backend(attention_backend)
         logger.info(f"Using attention backend: {backend} "
                     f"(available: {list_available_attention_backends()})")
-        enable_shifted_window_self_attention(self, window_hw=self._self_attn_window_hw)
+        if device is not None or dtype is not None:
+            blocks, self.blocks = self.blocks, nn.ModuleList()
+            try:
+                self.to(device, dtype)  # everything but the blocks
+            finally:
+                self.blocks = blocks
         if fp8:
             # after QKV fusion (FP8 copies of the fused projections), before compile
-            from .fp8 import convert_blocks_to_fp8
-            n = convert_blocks_to_fp8(self)
+            from .fp8 import convert_block_to_fp8
+        proc = WanShiftWindow2DInferProcessor(window_hw=self._self_attn_window_hw)
+        n = 0
+        for i, blk in enumerate(self.blocks):
+            if device is not None or dtype is not None:
+                blk.to(device, dtype)
+            _prepare_block_attention(blk, i, proc)
+            if fp8:
+                n += convert_block_to_fp8(blk)
+        if fp8:
             logger.info(f"FP8 DiT: {n} block GEMMs converted")
         if use_torch_compile:
             compile_transformer_blocks(self, mode=compile_mode)

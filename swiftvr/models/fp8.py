@@ -149,22 +149,25 @@ def fp8_supported(device) -> bool:
     return device.type == "cuda" and torch.cuda.get_device_capability(device) >= (8, 9)
 
 
-def convert_blocks_to_fp8(model) -> int:
-    """Swap every transformer block's attention projections and FFN for FP8
+def convert_block_to_fp8(blk) -> int:
+    """Swap one transformer block's attention projections and FFN for FP8
     versions, one module at a time (the bf16 original is freed as soon as its
     FP8 copy exists). Must run after ``fuse_projections``. Returns the number of
     GEMMs converted."""
+    blk = getattr(blk, "_orig_mod", blk)
     n = 0
-    for blk in model.blocks:
-        blk = getattr(blk, "_orig_mod", blk)
-        for attn in (blk.attn1, blk.attn2):
-            for name in ("to_qkv", "to_q", "to_kv"):
-                lin = getattr(attn, name, None)
-                if isinstance(lin, nn.Linear):
-                    setattr(attn, name, FP8Linear(lin))
-                    n += 1
-            attn.to_out[0] = FP8Linear(attn.to_out[0])
-            n += 1
-        blk.ffn = FP8FeedForward(blk.ffn)
-        n += 2
-    return n
+    for attn in (blk.attn1, blk.attn2):
+        for name in ("to_qkv", "to_q", "to_kv"):
+            lin = getattr(attn, name, None)
+            if isinstance(lin, nn.Linear):
+                setattr(attn, name, FP8Linear(lin))
+                n += 1
+        attn.to_out[0] = FP8Linear(attn.to_out[0])
+        n += 1
+    blk.ffn = FP8FeedForward(blk.ffn)
+    return n + 2
+
+
+def convert_blocks_to_fp8(model) -> int:
+    """``convert_block_to_fp8`` for every block of ``model``."""
+    return sum(convert_block_to_fp8(blk) for blk in model.blocks)

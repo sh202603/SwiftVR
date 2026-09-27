@@ -132,7 +132,12 @@ class SwiftVRPipeline:
         self.reae.to(self.device, self.dtype).eval()
         if self.tae_stream.fused and self.device.type == "cuda":
             to_channels_last(self.reae)
-        self.transformer.to(self.device, self.dtype).eval()
+        # With fp8_dit the preparing call moves the DiT block by block, FP8-
+        # converting each on arrival, so the full bf16 DiT (~9.3 GiB) is never
+        # on the GPU next to the FP8 copy (load peak ~= the FP8 weights).
+        load_by_block = fp8_dit and not self._prepared
+        if not load_by_block:
+            self.transformer.to(self.device, self.dtype).eval()
 
         enable_max_fps_runtime(allow_tf32=True, cudnn_benchmark=cudnn_benchmark)
         self._cudnn_benchmark = bool(cudnn_benchmark)
@@ -141,12 +146,13 @@ class SwiftVRPipeline:
                 attention_backend=attention_backend,
                 use_torch_compile=torch_compile,
                 compile_mode="default",
-                fp8=fp8_dit)
+                fp8=fp8_dit,
+                **({"device": self.device, "dtype": self.dtype} if load_by_block else {}))
             self._prepared = True
             self._fp8_dit = bool(fp8_dit)
             self._torch_compile = bool(torch_compile)
             if fp8_dit:
-                torch.cuda.empty_cache()  # return the freed bf16 weights
+                torch.cuda.empty_cache()  # return the last freed bf16 block
         return self
 
     # ------------------------------------------------------------------ #
