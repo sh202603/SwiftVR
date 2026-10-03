@@ -41,7 +41,7 @@ logger = logging.get_logger(__name__)
 # --------------------------------------------------------------------------- #
 
 _AVAILABLE_BACKENDS: set = {"sdpa"}
-_BACKEND_PRIORITY = ("flash_attn_3", "flash_attn_2", "sageattention", "cudnn", "sdpa", "xformers")
+_BACKEND_PRIORITY = ("kitchen", "flash_attn_3", "flash_attn_2", "sageattention", "cudnn", "sdpa", "xformers")
 _ATTN_BACKEND: Optional[str] = None
 
 try:
@@ -79,6 +79,18 @@ try:
     _AVAILABLE_BACKENDS.add("xformers")
 except Exception:
     _xformers_mea = None
+
+try:
+    # comfy-kitchen INT8-quantized Q/K attention ("kitchen"). Installing the
+    # package (`uv sync --extra kitchen`) is the opt-in: once present it is
+    # auto's first choice. Its output differs from cudnn's only at the DiT's
+    # run-to-run noise floor (~53 dB; visually A/B'd 2026-10-03).
+    import comfy_kitchen as _ck
+    _ck_int8_attention = _ck.int8_attention
+    if _ck.int8_attention_is_available():
+        _AVAILABLE_BACKENDS.add("kitchen")
+except Exception:
+    _ck_int8_attention = None
 
 
 def list_available_attention_backends() -> Tuple[str, ...]:
@@ -132,6 +144,10 @@ def _dense_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tens
 
     if backend == "xformers" and _xformers_mea is not None:
         return _xformers_mea(q, k, v, attn_bias=None)
+
+    if backend == "kitchen" and _ck_int8_attention is not None:
+        out = _ck_int8_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        return out.transpose(1, 2)
 
     if backend == "cudnn" and _CUDNN_SDPA_PRIORITY is not None:
         with sdpa_kernel(_CUDNN_SDPA_PRIORITY, set_priority=True):

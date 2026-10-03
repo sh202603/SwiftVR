@@ -43,8 +43,10 @@ def build_parser():
     p.add_argument("--no-reae-fusion", action="store_true",
                    help="Run the autoencoder with plain PyTorch ops (NCHW) instead of channels-last "
                         "fused cuDNN convolutions.")
-    p.add_argument("--attention_backend", type=str, default="auto", choices=["auto", "sdpa", "cudnn", "flash_attn_2", "flash_attn_3", "sageattention", "xformers"],
-                    help="Attention backend. 'auto' lets SwiftVR pick the fastest available backend.",)
+    p.add_argument("--attention_backend", type=str, default="auto", choices=["auto", "sdpa", "cudnn", "flash_attn_2", "flash_attn_3", "sageattention", "xformers", "kitchen"],
+                    help="Attention backend. 'auto' lets SwiftVR pick the fastest available backend; "
+                         "'kitchen' (comfy-kitchen INT8 Q/K attention, installed via `uv sync --extra kitchen`) "
+                         "is its first choice when present. Pass 'cudnn' for the exact pre-kitchen output.",)
     p.add_argument("--torch_compile", action="store_true", help="Enable torch.compile. Disabled by default to avoid long recompilation on dynamic paths.",)
     p.add_argument("--fp8-dit", action="store_true",
                    help="Run the DiT's linear layers in FP8 (RTX 40 series or newer, bfloat16): "

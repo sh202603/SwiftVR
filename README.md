@@ -31,6 +31,7 @@ The model and checkpoint are unchanged; only packaging and inference code differ
   * cuDNN attention picked automatically when FlashAttention/SageAttention is absent
   * fused channels-last cuDNN convolutions in the autoencoder (`--no-reae-fusion` to disable)
   * opt-in FP8 DiT (`--fp8-dit`, RTX 40 series or newer)
+  * INT8 attention via comfy-kitchen (`uv sync --extra kitchen`; picked by `auto` once installed)
   * `--torch_compile` working on Windows via `triton-windows`
 
   On an RTX 5060 Ti 16GB (640×480 → 1280×960) throughput goes from 9.1 to
@@ -95,6 +96,7 @@ cd SwiftVR
 # With uv (Windows / Linux). torch is pulled from the CUDA 13.2 index configured
 # in pyproject.toml (required for Blackwell GPUs such as RTX 50xx).
 uv sync                       # creates .venv (Python >= 3.12) and installs `swiftvr`
+uv sync --extra kitchen       # optional: comfy-kitchen INT8 attention (--attention_backend kitchen)
 uv run swiftvr --help
 
 # Or install the `swiftvr` command globally on PATH:
@@ -229,6 +231,18 @@ Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughp
   memory). `--no-reae-fusion` restores the plain PyTorch path.
 * `--fp8-dit` runs the DiT's linear layers in FP8 (RTX 40 series or newer, bfloat16).
   Its output differs slightly from bfloat16 (≈47 dB PSNR against the bfloat16 output).
+* The `kitchen` backend runs attention with INT8-quantized Q/K via
+  [comfy-kitchen](https://github.com/comfy-org/comfy-kitchen) (`uv sync --extra kitchen`;
+  prebuilt CUDA wheels for Windows and Linux). On an RTX 5080 16GB
+  (640×480 → 1280×960) it raised eager throughput from 12.0 to 17.0 fps in
+  bfloat16 and from 19.6 to 25.7 fps with `--fp8-dit`; combined with
+  `--torch_compile` the gain shrinks to a few percent. Output stays bit-identical
+  across runs; the difference against the cuDNN backend is at the model's noise
+  floor (≈53 dB PSNR), and a visual A/B found no difference. Installing the
+  extra is the opt-in: once present, `auto` prefers it over every other backend.
+  Pass `--attention_backend cudnn` to reproduce the exact pre-kitchen output
+  (note that tiled `--resume` runs started without comfy-kitchen need this flag
+  to reuse their tiles, because the resolved backend is part of the tile hash).
 * `--torch_compile` fuses the DiT's elementwise ops. Compiling takes the first two
   chunks (roughly 10–20 s), so it pays off only on longer videos. On Windows it uses
   `triton-windows` (installed by `uv sync`); no C++ compiler is needed. On Linux,
