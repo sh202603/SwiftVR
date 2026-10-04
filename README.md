@@ -157,6 +157,7 @@ Tunable knobs include:
 * `fps`: output video frame rate
 * `quality`: 0–100, mapped to x265 CRF
 * `queue_size`: pipeline queue size
+* `copy_audio`: copy the input video's audio tracks into the output mp4 (default on)
 
 ### One clip in memory
 
@@ -210,6 +211,12 @@ swiftvr \
 ```
 
 Use `--png` to write a PNG sequence. `python scripts/inference.py` accepts the same arguments.
+
+The audio tracks of a video input are copied into the output mp4 after restoration
+(stream copy, no re-encoding; `--no-audio` turns this off). If a track cannot be
+stored in the output container the output is kept without audio and a warning is
+printed. The video is up to 3 frames shorter than the input (frame count truncated
+to `4k+1`), so the audio may outlast the picture by that much.
 
 Memory knobs: `--reae-frame-batch-size` (default 2) bounds how many frames the
 autoencoder's stateless layers process at once; `--cudnn-benchmark` is off by

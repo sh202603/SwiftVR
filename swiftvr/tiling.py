@@ -29,6 +29,7 @@ from .io import (
     VIDEO_EXTS,
     FfmpegFrameReader,
     append_chunk_to_png_dir,
+    copy_audio_tracks,
     get_video_info,
     list_image_frames,
     open_stream_video_writer,
@@ -473,9 +474,10 @@ def stitch_tiles(plan: TilePlan, *, quality=85, save_format="", ffmpeg_preset=""
 
 def finish_tiled_run(plan: TilePlan, *, quality=85, save_format="", ffmpeg_preset="",
                      output_height=None, device="cuda", verbose=True, t_start=None,
-                     peak_allocated=0, peak_reserved=0) -> dict:
-    """Stitch, delete the temp tile directory and return ``restore_video``-style
-    stats. ``t_start`` and the peaks carry over from the tile loop, if any."""
+                     peak_allocated=0, peak_reserved=0, copy_audio=True) -> dict:
+    """Stitch, copy the input's audio into the mp4 (``copy_audio``), delete the
+    temp tile directory and return ``restore_video``-style stats. ``t_start``
+    and the peaks carry over from the tile loop, if any."""
     t_start = time.perf_counter() if t_start is None else t_start
     dev = torch.device(device)
     use_cuda = dev.type == "cuda" and torch.cuda.is_available()
@@ -484,6 +486,8 @@ def finish_tiled_run(plan: TilePlan, *, quality=85, save_format="", ffmpeg_prese
     _log(f"Stitching {plan.num_tiles} tiles -> {plan.output}", verbose)
     written = stitch_tiles(plan, quality=quality, save_format=save_format, ffmpeg_preset=ffmpeg_preset,
                            output_height=output_height, device=dev, verbose=verbose)
+    if copy_audio and not plan.png_save:
+        copy_audio_tracks(plan.final_video_path, plan.input_path, verbose=verbose)
     if use_cuda:
         peak_allocated = max(peak_allocated, torch.cuda.max_memory_allocated(dev))
         peak_reserved = max(peak_reserved, torch.cuda.max_memory_reserved(dev))

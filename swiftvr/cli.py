@@ -34,6 +34,8 @@ def build_parser():
     p.add_argument("--fps", type=float, default=None, help="Output fps (defaults to source fps).")
     p.add_argument("--quality", type=int, default=60, help="Output quality 0-100 (maps to x265 CRF).")
     p.add_argument("--png", action="store_true", help="Write a PNG sequence instead of an mp4.")
+    p.add_argument("--no-audio", action="store_true",
+                   help="Do not copy the input video's audio tracks into the output mp4.")
     p.add_argument("--save-format", type=str, default="", help="Set to 'yuv444p' for 4:4:4 mp4.")
     p.add_argument("--ffmpeg-preset", type=str, default="", help="x265 preset (e.g. fast, medium).")
     p.add_argument("--queue-size", type=int, default=3, help="Pipeline queue depth.")
@@ -114,7 +116,8 @@ def _stitch_only_if_complete(args) -> bool:
     _log("All tiles already complete; skipping the model load and stitching.", not args.quiet)
     stats = finish_tiled_run(plan, quality=args.quality, save_format=args.save_format,
                              ffmpeg_preset=args.ffmpeg_preset, output_height=args.output_height,
-                             device=args.device, verbose=not args.quiet, t_start=t_start)
+                             device=args.device, verbose=not args.quiet, t_start=t_start,
+                             copy_audio=not args.no_audio)
     _print_stats(stats)
     return True
 
@@ -154,6 +157,7 @@ def main():
         temp_quality=args.temp_quality,
         resume=args.resume,
         temp_dir=args.temp_dir,
+        copy_audio=not args.no_audio,
     )
     _print_stats(stats)
 

@@ -21,6 +21,7 @@ from .models import ReAE, WanTransformer3DModel
 from .streaming import StreamingTAE, StreamingDiT
 from .streaming.tae import to_channels_last
 from .io import (
+    copy_audio_tracks,
     get_video_info,
     selected_output_frame_names,
     preprocess_clip_uint8,
@@ -198,6 +199,7 @@ class SwiftVRPipeline:
         temp_quality: int = 80,
         resume: bool = False,
         temp_dir=None,
+        copy_audio: bool = True,
     ) -> dict:
         """Restore a whole video file or image folder.
 
@@ -215,6 +217,9 @@ class SwiftVRPipeline:
         end; ``tile_overlap`` is in LQ pixels, ``output_height`` downscales the
         blended result, and ``resume`` reuses the tiles that an interrupted run
         with the same settings completed. These only apply with ``tile_size``.
+
+        ``copy_audio`` stream-copies the audio tracks of a video input into the
+        output mp4 after restoration (not for ``png_save`` or image folders).
         """
         if clip_len % 4 != 0:
             raise ValueError(f"clip_len must be a multiple of 4, got {clip_len}")
@@ -228,7 +233,8 @@ class SwiftVRPipeline:
                 save_format=save_format, ffmpeg_preset=ffmpeg_preset, queue_size=queue_size,
                 verbose=verbose, pad_align=pad_align, tile_size=tile_size,
                 tile_overlap=tile_overlap, output_height=output_height,
-                temp_quality=temp_quality, resume=resume, temp_dir=temp_dir)
+                temp_quality=temp_quality, resume=resume, temp_dir=temp_dir,
+                copy_audio=copy_audio)
         if resume:
             tiling._warn("resume only applies to tiled runs (tile_size); running normally.")
         if output_height is not None:
@@ -277,6 +283,8 @@ class SwiftVRPipeline:
             verbose=verbose,
             pad_mode="reflect" if pad_align else "constant",
         )
+        if copy_audio and not png_save:
+            copy_audio_tracks(final_video_path, input_path, verbose=verbose)
         # Peak over this call only (model weights included, since they stay resident).
         max_alloc = torch.cuda.max_memory_allocated(self.device) if use_cuda else 0
         max_reserved = torch.cuda.max_memory_reserved(self.device) if use_cuda else 0
@@ -289,7 +297,7 @@ class SwiftVRPipeline:
     def _restore_video_tiled(self, input_path, output_path, *, resolution, upscale, clip_len,
                              dit_overlap, fps, quality, png_save, save_format, ffmpeg_preset,
                              queue_size, verbose, pad_align, tile_size, tile_overlap,
-                             output_height, temp_quality, resume, temp_dir) -> dict:
+                             output_height, temp_quality, resume, temp_dir, copy_audio) -> dict:
         from .models.transformer import get_attention_backend
 
         t_start = time.perf_counter()
@@ -362,7 +370,7 @@ class SwiftVRPipeline:
         return tiling.finish_tiled_run(
             plan, quality=quality, save_format=save_format, ffmpeg_preset=ffmpeg_preset,
             output_height=output_height, device=self.device, verbose=verbose, t_start=t_start,
-            peak_allocated=peak_alloc, peak_reserved=peak_reserved)
+            peak_allocated=peak_alloc, peak_reserved=peak_reserved, copy_audio=copy_audio)
 
     # ------------------------------------------------------------------ #
     # One in-memory clip (frame-count preserving)                        #

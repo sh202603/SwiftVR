@@ -6,7 +6,9 @@ either an mp4 (libx265) or a PNG sequence.
 """
 
 import os
+import re
 import math
+import subprocess
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
@@ -272,6 +274,57 @@ def open_stream_video_writer(output_path, fps=8, video_format="", preset="", qua
     return imageio.get_writer(output_path, fps=fps, codec="libx265", pixelformat=pix,
                              macro_block_size=None, ffmpeg_log_level="error",
                              ffmpeg_params=["-crf", str(crf), "-x265-params", "log-level=error"] + extra)
+
+
+_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+.*?: Audio:")
+
+
+def has_audio_stream(video_path) -> bool:
+    """True if ``video_path`` contains at least one audio stream.
+
+    imageio-ffmpeg ships ffmpeg but not ffprobe, so the stream list is read
+    from ``ffmpeg -i`` (which exits non-zero for want of an output file; the
+    stream info is still printed to stderr)."""
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostdin", "-i", str(video_path)]
+    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE)
+    return _AUDIO_STREAM_RE.search(proc.stderr.decode("utf-8", errors="replace")) is not None
+
+
+def copy_audio_tracks(video_path, audio_source_path, verbose=True) -> bool:
+    """Stream-copy all audio tracks of ``audio_source_path`` into the silent
+    ``video_path`` (the mp4 written by the pipeline), in place; the video
+    stream is copied, not re-encoded. Returns True if audio was added.
+
+    Nothing happens when the source is an image folder or has no audio. If
+    the mux fails (e.g. an audio codec the output container cannot hold) the
+    silent video is kept and a warning is printed, so a long restoration run
+    never ends in a missing output."""
+    video_path = Path(video_path)
+    audio_source_path = Path(audio_source_path)
+    if audio_source_path.is_dir() or not has_audio_stream(audio_source_path):
+        return False
+
+    if verbose:
+        print("[swiftvr] Copying audio tracks...", flush=True)
+    # The silent video is moved aside and ffmpeg writes the muxed file to the
+    # final path; ``os.replace`` also overwrites a leftover from a crashed run.
+    temp = video_path.with_name(video_path.name + ".noaudio" + video_path.suffix)
+    os.replace(video_path, temp)
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+           "-i", str(temp), "-i", str(audio_source_path),
+           "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "copy", str(video_path)]
+    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE)
+    if proc.returncode == 0:
+        os.remove(temp)
+        return True
+    err = proc.stderr.decode("utf-8", errors="replace").strip()
+    print(f"[swiftvr] Warning: audio merge failed; the output has no audio.\n{err}", flush=True)
+    if video_path.exists():
+        os.remove(video_path)
+    os.replace(temp, video_path)
+    return False
 
 
 def _normalize_png_name(name: str) -> str:
