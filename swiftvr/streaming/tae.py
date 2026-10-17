@@ -33,11 +33,11 @@ def _conv_relu(conv, x):
                                         conv.dilation, conv.groups)
 
 
-def _memblock_fused(b, x, past):
+def _memblock_fused(b, x, xp):
     """MemBlock.forward with the three convs' bias/ReLU and the residual add in
-    cuDNN epilogues."""
+    cuDNN epilogues. ``xp`` is the first conv's input ``cat([x, past], 1)``."""
     c0, c2, c4 = b.conv[0], b.conv[2], b.conv[4]
-    h = _conv_relu(c0, torch.cat([x, past], 1))
+    h = _conv_relu(c0, xp)
     h = _conv_relu(c2, h)
     return torch.cudnn_convolution_add_relu(h, c4.weight, b.skip(x), 1.0, c4.bias, c4.stride,
                                             c4.padding, c4.dilation, c4.groups)
@@ -200,8 +200,14 @@ def apply_parallel_with_boundary(model, x, state=None, frame_batch_size=None, fu
             T_ = NT // N
             _x = x.view(N, T_, C, H, W)
             key = f"mem_{i}"
-            # past[t] = x[t-1]; built in x's memory layout (NCHW or NHWC)
-            mem = torch.empty_like(x)
+            # past[t] = x[t-1]. fused: written straight into the channel half of
+            # the channels-last cat([x, past], 1) buffer (no separate past + cat).
+            if fused:
+                xp = torch.empty((NT, 2 * C, H, W), dtype=x.dtype, device=x.device, memory_format=_CL)
+                xp[:, :C].copy_(x)
+                mem = xp[:, C:]
+            else:
+                mem = torch.empty_like(x)
             mv = mem.view(N, T_, C, H, W)
             mv[:, 1:].copy_(_x[:, :-1])
             if key in state:
@@ -209,7 +215,7 @@ def apply_parallel_with_boundary(model, x, state=None, frame_batch_size=None, fu
             else:
                 mv[:, :1].zero_()
             new_state[key] = _x[:, -1:].detach().clone()
-            x = _memblock_fused(b, x, mem) if fused else b(x, mem)
+            x = _memblock_fused(b, x, xp) if fused else b(x, mem)
 
         elif isinstance(b, TPool):
             NT, C, H, W = x.shape
