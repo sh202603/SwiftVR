@@ -2,7 +2,9 @@
 
 Weights are quantized once with a per-tensor scale; activations get a dynamic
 per-tensor scale on every call, computed on the GPU (no host sync) by two Triton
-kernels (abs-max reduction, then scale + saturate + cast). The GEMM itself is
+kernels (abs-max reduction, then scale + saturate + cast). Under torch.compile
+the same quantization is written in torch ops instead, so Inductor fuses it with
+the ops producing the activation (DiT chunk 683 -> 651 ms). The GEMM itself is
 ``torch._scaled_mm`` (cuBLASLt), which on GeForce Blackwell runs ~3.5x faster
 than the bf16 GEMM (bf16 with fp32 accumulation is half rate there) and halves
 the weight memory.
@@ -17,6 +19,7 @@ The quantization kernels follow flashvsr-sm89-ops
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -24,6 +27,7 @@ FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
 _BLOCK = 8192
 _GELU_C0 = 0.7978845608028654  # sqrt(2/pi), as in aten's tanh GELU
+TORCH_QUANT_UNDER_COMPILE = True
 
 
 @triton.jit
@@ -68,9 +72,22 @@ def _quant_kernel(x_ptr, b_ptr, amax_ptr, scale_ptr, out_ptr, n, N, HAS_BIAS: tl
     tl.store(out_ptr + offs, v.to(tl.float8e4nv), mask=mask)
 
 
+def _quantize_fp8_torch(x, bias=None, gelu=False):
+    """``quantize_fp8`` in plain torch ops, for ``torch.compile``: Inductor can
+    then fuse the abs-max and the quantization with the ops producing ``x``."""
+    if bias is not None:
+        x = x + bias
+    if gelu:
+        x = F.gelu(x, approximate="tanh")
+    scale = x.abs().amax().float().clamp(min=1e-12) / FP8_MAX
+    return (x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8), scale
+
+
 def quantize_fp8(x: torch.Tensor, bias: torch.Tensor = None, gelu: bool = False):
     """``x`` contiguous bf16 ``[M, K]`` -> (FP8 ``[M, K]``, fp32 scale on the GPU).
     Quantizes ``gelu_tanh(x + bias)`` (each part optional) without materializing it."""
+    if TORCH_QUANT_UNDER_COMPILE and torch.compiler.is_compiling():
+        return _quantize_fp8_torch(x, bias, gelu)
     n = x.numel()
     amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     scale = torch.empty((), dtype=torch.float32, device=x.device)
