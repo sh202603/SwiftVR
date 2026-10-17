@@ -35,7 +35,7 @@ The model and checkpoint are unchanged; only packaging and inference code differ
   * `--torch_compile` working on Windows via `triton-windows`
 
   On an RTX 5060 Ti 16GB (640×480 → 1280×960) throughput goes from 9.1 to
-  26.0 fps and peak memory from 12.0 to 8.0 GiB; see
+  26.5 fps and peak memory from 12.0 to 8.2 GiB; see
   [Command line](#command-line) for the per-option table.
 * **`cudnn.benchmark` off by default** (`--cudnn-benchmark` to enable). This makes
   the output bit-identical across runs and avoids several GiB of peak memory from
@@ -228,8 +228,8 @@ Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughp
 | --- | --- | --- |
 | `--attention_backend sdpa --no-reae-fusion` (previous defaults) | 9.1 | 12.0 GiB |
 | `--fp8-dit --no-reae-fusion` | 15.5 | 7.4 GiB |
-| `--fp8-dit` | 18.1 | 8.0 GiB |
-| `--fp8-dit --torch_compile` | 26.0 | 8.0 GiB |
+| `--fp8-dit` | 18.5 | 8.0 GiB |
+| `--fp8-dit --torch_compile` | 26.5 | 8.2 GiB |
 
 * The default attention backend `auto` picks PyTorch's cuDNN attention when
   FlashAttention/SageAttention is not installed.
