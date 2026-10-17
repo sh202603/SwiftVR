@@ -57,6 +57,53 @@ def _tgrow2_fused(tg, x):
     return y.permute(0, 3, 1, 2)
 
 
+def _is_up2_conv3(up, conv):
+    """nearest x2 Upsample followed by a stride-1 3x3 conv with zero padding 1."""
+    return (isinstance(up, nn.Upsample) and up.mode == "nearest" and up.size is None
+            and up.scale_factor in (2, 2.0) and isinstance(conv, nn.Conv2d)
+            and conv.kernel_size == (3, 3) and conv.stride == (1, 1) and conv.padding == (1, 1)
+            and conv.dilation == (1, 1) and conv.groups == 1 and conv.padding_mode == "zeros")
+
+
+def _fold_up2_weight(w):
+    """[Co, Ci, 3, 3] -> [4Co, Ci, 2, 2], one 2x2 kernel per output phase (a, b).
+    After nearest x2 upsampling, output row 2i+a of the 3x3 conv reads input
+    rows (i-1, i) with taps (W0, W1+W2) for a=0 and rows (i, i+1) with taps
+    (W0+W1, W2) for a=1; columns likewise."""
+    def taps(w, a, dim):
+        w0, w1, w2 = w.unbind(dim)
+        return torch.stack([w0, w1 + w2] if a == 0 else [w0 + w1, w2], dim)
+    w = w.float()
+    return torch.cat([taps(taps(w, a, 2), b, 3) for a in (0, 1) for b in (0, 1)], 0)
+
+
+def _up2_conv3_fused(conv, x, relu):
+    """conv(Upsample(x, 2, nearest)) [+ ReLU] at the input resolution: one 2x2
+    conv (padding 1) for all four output phases, then a strided copy of each
+    phase into the channels-last output. 16 instead of 36 MACs per input pixel
+    and channel pair, and the 4x upsampled input is never materialized."""
+    key = (conv.weight.data_ptr(), conv.weight._version, x.dtype, x.device)
+    cache = getattr(conv, "_up2_fold", None)
+    if cache is None or cache[0] != key:
+        k = _fold_up2_weight(conv.weight).to(x.dtype).contiguous(memory_format=_CL)
+        bias = None if conv.bias is None else conv.bias.to(x.dtype).repeat(4)
+        cache = conv._up2_fold = (key, k, bias)
+    _, k, bias = cache
+    if relu:
+        y = torch.cudnn_convolution_relu(x, k, bias, (1, 1), (1, 1), (1, 1), 1)
+    else:
+        y = F.conv2d(x, k, bias, padding=1)
+    # y[:, phase (a, b), p, q] is output pixel (2(p-a)+a, 2(q-b)+b)
+    N, _, H, W = x.shape
+    Co = conv.out_channels
+    out = torch.empty((N, Co, 2 * H, 2 * W), dtype=y.dtype, device=y.device, memory_format=_CL)
+    for a in (0, 1):
+        for b in (0, 1):
+            c = (2 * a + b) * Co
+            out[:, :, a::2, b::2].copy_(y[:, c:c + Co, a:a + H, b:b + W])
+    return out
+
+
 def run_frame_batches(fn, x, frame_batch_size=None):
     """Apply a frame-independent ``fn`` to ``x`` (``[F, C, H, W]``) a few frames
     at a time, writing into one preallocated output so that only one batch's
@@ -86,6 +133,11 @@ def _run_layers(layers, fused=False):
         i = 0
         while i < len(layers):
             layer = layers[i]
+            if use_fused and i + 1 < len(layers) and _is_up2_conv3(layer, layers[i + 1]):
+                relu = i + 2 < len(layers) and isinstance(layers[i + 2], nn.ReLU)
+                x = _up2_conv3_fused(layers[i + 1], x, relu)
+                i += 3 if relu else 2
+                continue
             if (use_fused and isinstance(layer, nn.Conv2d) and i + 1 < len(layers)
                     and isinstance(layers[i + 1], nn.ReLU)):
                 x = _conv_relu(layer, x)

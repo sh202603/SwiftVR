@@ -35,7 +35,7 @@ The model and checkpoint are unchanged; only packaging and inference code differ
   * `--torch_compile` working on Windows via `triton-windows`
 
   On an RTX 5060 Ti 16GB (640×480 → 1280×960) throughput goes from 9.1 to
-  23.3 fps and peak memory from 12.0 to 8.0 GiB; see
+  24.5 fps and peak memory from 12.0 to 8.0 GiB; see
   [Command line](#command-line) for the per-option table.
 * **`cudnn.benchmark` off by default** (`--cudnn-benchmark` to enable). This makes
   the output bit-identical across runs and avoids several GiB of peak memory from
@@ -228,14 +228,16 @@ Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughp
 | --- | --- | --- |
 | `--attention_backend sdpa --no-reae-fusion` (previous defaults) | 9.1 | 12.0 GiB |
 | `--fp8-dit --no-reae-fusion` | 15.5 | 7.4 GiB |
-| `--fp8-dit` | 17.2 | 8.0 GiB |
-| `--fp8-dit --torch_compile` | 23.3 | 8.0 GiB |
+| `--fp8-dit` | 18.1 | 8.0 GiB |
+| `--fp8-dit --torch_compile` | 24.5 | 8.0 GiB |
 
 * The default attention backend `auto` picks PyTorch's cuDNN attention when
   FlashAttention/SageAttention is not installed.
 * The autoencoder runs channels-last with fused cuDNN convolutions by default
-  (encoder 110 → 60 ms, decoder 346 → 244 ms per 24-frame chunk, ~0.6 GiB more
-  memory). `--no-reae-fusion` restores the plain PyTorch path.
+  (encoder 110 → 60 ms, decoder 346 → 198 ms per 24-frame chunk, ~0.6 GiB more
+  memory). Each nearest 2× upsample + 3×3 conv in the decoder runs as one 2×2
+  conv per output phase at the low resolution (2.25× fewer MACs, same result up
+  to bf16 rounding). `--no-reae-fusion` restores the plain PyTorch path.
 * `--fp8-dit` runs the DiT's linear layers in FP8 (RTX 40 series or newer, bfloat16).
   Its output differs slightly from bfloat16 (≈47 dB PSNR against the bfloat16 output).
 * The `kitchen` backend runs attention with INT8-quantized Q/K via
