@@ -221,6 +221,9 @@ to `4k+1`), so the audio may outlast the picture by that much.
 Memory knobs: `--reae-frame-batch-size` (default 2) bounds how many frames the
 autoencoder's stateless layers process at once; `--cudnn-benchmark` is off by
 default because its conv-algorithm search adds several GiB of peak memory.
+`--clip-len 16` lowers peak memory by about 1 GiB at 1280×960 output (8.2 → 7.1 GiB
+with `--fp8-dit --torch_compile`) for ~1.3% lower throughput; a visual A/B against
+the default 24 (and 32, 48) showed no difference. 48 needs 11.3 GiB and is ~4% slower.
 
 Speed knobs (RTX 5060 Ti 16GB, 640×480 → 1280×960, steady-state GPU throughput):
 
