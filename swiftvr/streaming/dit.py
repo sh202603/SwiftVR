@@ -157,8 +157,8 @@ class StreamingDiT:
 
         k = min(self.overlap, F_cur)
         if k > 0:
-            self._prev_lq = lq[:, :, -k:].detach().cpu().clone()
-            self._prev_out = den_out[:, :, -k:].detach().cpu().clone()
+            self._prev_lq = lq[:, :, -k:].detach().clone()
+            self._prev_out = den_out[:, :, -k:].detach().clone()
         else:
             self._prev_lq = self._prev_out = None
 
@@ -167,7 +167,7 @@ class StreamingDiT:
 
     @torch.inference_mode()
     def denoise_last_chunk(self, z_new_ntchw, spec: ChunkSpec, prompt_emb,
-                           prev_dit_out_cpu: Optional[torch.Tensor], n_lat: int, device, dtype):
+                           prev_lq_latents: Optional[torch.Tensor], n_lat: int, device, dtype):
         """LAST chunk: pad the (b+1) new latents up to (n_lat+1) with the previous
         chunk's latents (or zeros) for a correct RoPE offset, run one pass, and
         keep only the new ``b+1`` denoised latents.
@@ -177,8 +177,8 @@ class StreamingDiT:
 
         z_bcfhw = z_new_ntchw.permute(0, 2, 1, 3, 4).contiguous()
         if pad_count > 0:
-            if prev_dit_out_cpu is not None:
-                pad_z = prev_dit_out_cpu[:, :, -pad_count:].to(device=device, dtype=dtype)
+            if prev_lq_latents is not None:
+                pad_z = prev_lq_latents[:, :, -pad_count:].to(device=device, dtype=dtype)
             else:
                 pad_z = torch.zeros(z_bcfhw.shape[0], z_bcfhw.shape[1], pad_count,
                                     z_bcfhw.shape[3], z_bcfhw.shape[4], device=device, dtype=dtype)

@@ -71,16 +71,16 @@ def _stop_item():
 
 
 def restore_chunk(spec, gpu_rgb, *, tae_stream, dit_stream, prompt_emb, device, dtype,
-                  n_lat, prev_lq_latents_cpu, out_h, out_w, pad_h, pad_w, upscale_mode,
+                  n_lat, prev_lq_latents, out_h, out_w, pad_h, pad_w, upscale_mode,
                   trim=None, pad_mode="constant"):
     """Restore one chunk of the fixed causal protocol.
 
     ``gpu_rgb`` is ``[T, H, W, 3]`` uint8 on ``device`` with exactly
-    ``spec.frame_count`` frames. ``prev_lq_latents_cpu`` is the tail (``n_lat``
+    ``spec.frame_count`` frames. ``prev_lq_latents`` is the tail (``n_lat``
     latents) of the previous FIRST/MIDDLE chunk's LQ latents, which the LAST
     chunk is left-padded with (``None`` before the first chunk).
 
-    Returns ``(rgb_out, prev_lq_latents_cpu)``: the restored frames as
+    Returns ``(rgb_out, prev_lq_latents)``: the restored frames as
     ``[T, out_h, out_w, 3]`` uint8 on ``device`` and the updated padding state.
     Shared by the offline runner and ``SwiftVRPipeline.restore_clip`` so the two
     paths cannot drift apart.
@@ -92,16 +92,16 @@ def restore_chunk(spec, gpu_rgb, *, tae_stream, dit_stream, prompt_emb, device, 
 
     if spec.ctype == ChunkType.LAST:
         z_ntchw = dit_stream.denoise_last_chunk(
-            z, spec, prompt_emb, prev_lq_latents_cpu, n_lat, device, dtype)
+            z, spec, prompt_emb, prev_lq_latents, n_lat, device, dtype)
     else:
         z_bcfhw = z.permute(0, 2, 1, 3, 4).contiguous()
         z_den = dit_stream.denoise(z_bcfhw, prompt_emb)
         z_ntchw = z_den.permute(0, 2, 1, 3, 4).contiguous()
-        prev_lq_latents_cpu = z_bcfhw[:, :, -n_lat:].detach().cpu().clone()
+        prev_lq_latents = z_bcfhw[:, :, -n_lat:].detach().clone()  # stays on the GPU: no host sync
 
     rgb_out = tae_stream.decode_chunk_fixed(z_ntchw, spec)
     rgb_out = ntchw_to_uint8_thwc(crop_spatial_padding_ntchw(rgb_out, pad_h, pad_w))
-    return rgb_out, prev_lq_latents_cpu
+    return rgb_out, prev_lq_latents
 
 
 def _fmt_duration(seconds):
@@ -266,6 +266,8 @@ def run_pipeline(
         if use_cuda:
             se = torch.cuda.Event(enable_timing=True)
             ee = torch.cuda.Event(enable_timing=True)
+            # the GPU stage does not wait for its kernels, so order the copy after them
+            d2h_stream.wait_stream(torch.cuda.current_stream(device=device))
             with torch.cuda.stream(d2h_stream):
                 se.record(d2h_stream)
                 cpu_buf.copy_(item.rgb_out_gpu, non_blocking=True)
@@ -285,7 +287,7 @@ def run_pipeline(
             tae_stream.reset()
             dit_stream.reset()
             n_lat = clip_len // 4
-            prev_lq_latents_cpu = None
+            prev_lq_latents = None
 
             while True:
                 item = get(q_gpu)
@@ -296,6 +298,9 @@ def run_pipeline(
 
                 if item.h2d_event is not None:
                     torch.cuda.current_stream(device=device).wait_event(item.h2d_event)
+                    # allocated on h2d_stream: without this, the next H2D copy can
+                    # reuse the block while this chunk is still reading it
+                    item.gpu_rgb.record_stream(torch.cuda.current_stream(device=device))
 
                 if use_cuda:
                     t_start = torch.cuda.Event(enable_timing=True)
@@ -304,17 +309,18 @@ def run_pipeline(
                 else:
                     t0 = time.perf_counter()
 
-                item.rgb_out_gpu, prev_lq_latents_cpu = restore_chunk(
+                item.rgb_out_gpu, prev_lq_latents = restore_chunk(
                     item.spec, item.gpu_rgb,
                     tae_stream=tae_stream, dit_stream=dit_stream, prompt_emb=prompt_emb,
                     device=device, dtype=dtype, n_lat=n_lat,
-                    prev_lq_latents_cpu=prev_lq_latents_cpu,
+                    prev_lq_latents=prev_lq_latents,
                     out_h=out_h, out_w=out_w, pad_h=pad_h, pad_w=pad_w,
                     upscale_mode=upscale_mode, trim=trim, pad_mode=pad_mode)
 
                 if use_cuda:
                     t_end.record(torch.cuda.current_stream(device=device))
-                    item.timings["gpu"] = _event_elapsed_seconds(t_start, t_end)
+                    # read by the writer: waiting on t_end here would drain the GPU queue
+                    item.timings["_gpu"] = (t_start, t_end)
                 else:
                     item.timings["gpu"] = time.perf_counter() - t0
 
@@ -336,6 +342,8 @@ def run_pipeline(
                     continue
                 if item.d2h_event is not None:
                     item.d2h_event.synchronize()
+                if "_gpu" in item.timings:
+                    item.timings["gpu"] = _event_elapsed_seconds(*item.timings.pop("_gpu"))
                 item.rgb_out_gpu = None
 
                 n_written = n_consumed = 0

@@ -423,7 +423,7 @@ class SwiftVRPipeline:
         self.dit_stream.reset()
         self.dit_stream.overlap = 0
         n_lat = clip_len // 4
-        prev_lq_latents_cpu = None
+        prev_lq_latents = None
         # Preallocated (no torch.cat copy of the whole upscaled clip at the end).
         # Output frames are appended in order, not placed at spec.frame_start:
         # the first decode drops the decoder's causal-padding frames and the
@@ -433,11 +433,11 @@ class SwiftVRPipeline:
         pos = 0
         for spec in build_chunk_specs(t_pad, clip_len):
             chunk = frames[spec.frame_start:spec.frame_start + spec.frame_count]
-            rgb_out, prev_lq_latents_cpu = restore_chunk(
+            rgb_out, prev_lq_latents = restore_chunk(
                 spec, chunk,
                 tae_stream=self.tae_stream, dit_stream=self.dit_stream, prompt_emb=self.prompt_emb,
                 device=self.device, dtype=self.dtype, n_lat=n_lat,
-                prev_lq_latents_cpu=prev_lq_latents_cpu,
+                prev_lq_latents=prev_lq_latents,
                 out_h=out_h, out_w=out_w, pad_h=pad_h, pad_w=pad_w,
                 upscale_mode=self.upscale_mode)
             if rgb_out is None:
